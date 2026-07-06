@@ -136,6 +136,10 @@ START
   v
 [planner] -- decompose into sub-questions if complex
   |
+  |   (with UNIFIED_ANALYSIS=true, the three nodes intent_detect +
+  |    query_transform + planner collapse into a single analyze_query
+  |    node — one structured LLM call instead of three. See note below.)
+  |
   +-- simple query --------+-- multi-part query ------+
   |                         |                          |
   v                         v                          |
@@ -151,8 +155,8 @@ START
   +-- exhausted (>= 2) -> [web_search] --> [generate]
                                               |
                                               v
-                                          [critic] -- validates answer quality
-                                              |
+                                          [critic] -- extract claims, verify
+                                              |       vs sources, strip unsupported
                                               v
                                         [cache_store] -- saves for future hits
                                               |
@@ -162,6 +166,20 @@ START
                                               v
                                              END
 ```
+
+### Latency / cost optimizations (opt-in)
+
+The full path can issue 6–8 serial LLM calls. Two feature flags cut that
+down without changing default behavior (both default off):
+
+| Flag | Effect |
+|------|--------|
+| `UNIFIED_ANALYSIS=true` | Replaces `intent_detect` → `query_transform` → `planner` with a single `analyze_query` node (intent + entities + query rewrite + decomposition in one structured LLM call), removing two serial round-trips. Falls back to zero-LLM heuristics on error/circuit-open. |
+| `CRITIC_MODE` | `always` (default) verifies every answer; `adaptive` skips verification for low-risk answers (grader passed, no web fallback, not multi-part, under `CRITIC_SKIP_MAX_CHARS`); `off` disables the critic. |
+
+Retrieval also supports `retriever_strategy=auto`, which routes by detected
+intent: `factual` → `dense`, `comparative`/`analytical` → `hybrid_cross_rerank`,
+everything else → `hybrid`.
 
 ---
 
@@ -177,6 +195,7 @@ START
 | `cross_rerank` | Dense + cross-encoder model reranking | Fast, high-quality reranking |
 | `hybrid_cross_rerank` | Hybrid + cross-encoder reranking | Maximum retrieval quality |
 | `knowledge_graph` | Entity extraction + graph traversal + source retrieval | Multi-hop reasoning |
+| `auto` | Resolves to a concrete strategy from the query's detected intent (factual→dense, comparative/analytical→hybrid_cross_rerank, else hybrid) | Hands-off; let intent pick |
 
 ---
 
@@ -200,6 +219,7 @@ enterprise-rag-assistant/
 │   │   ├── state.py           # LangGraph shared state (TypedDict)
 │   │   ├── build_graph.py     # CRAG graph compilation & routing
 │   │   ├── nodes.py           # Core nodes: retrieve, grade, generate, critic
+│   │   ├── analyzer.py        # Unified query analysis (UNIFIED_ANALYSIS)
 │   │   ├── cache_nodes.py     # Cache lookup/store nodes
 │   │   ├── guardrail_node.py  # Input safety check node
 │   │   ├── intent_detector.py # Query intent classification
@@ -366,6 +386,16 @@ All settings are managed via environment variables (loaded from `.env`). The sys
 | `MAX_SUB_QUESTIONS` | `5` | Maximum sub-questions for decomposition |
 | `PARALLEL_SUB_QUERIES` | `false` | Process sub-queries in parallel |
 | `SUB_QUERY_MAX_WORKERS` | `3` | Thread pool size for parallel processing |
+
+### Pipeline Optimization
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `UNIFIED_ANALYSIS` | `false` | Collapse intent + query rewrite + decomposition into one LLM call (`analyze_query`) |
+| `CRITIC_MODE` | `always` | Answer verification: `always`, `adaptive` (skip low-risk), or `off` |
+| `CRITIC_SKIP_MAX_CHARS` | `600` | Under `adaptive`, max answer length eligible to skip the critic |
+| `INTENT_DETECTION_ENABLED` | `true` | Enable intent classification node |
+| `QUERY_TRANSFORM_ENABLED` | `true` | Enable query normalization/rewrite node |
 
 ### Memory & Caching
 

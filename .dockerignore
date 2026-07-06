@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+.env.*
 .git/
 .hypothesis/
 .pytest_cache/
@@ -10,3 +11,12 @@ checkpoints/
 chroma_db/
 *.db
 .claude/
+.github/
+htmlcov/
+.coverage
+*.md
+!requirements.txt
+.ragas_cache/
+.DS_Store
+.idea/
+.vscode/

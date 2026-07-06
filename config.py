@@ -78,7 +78,17 @@ class Settings:
     rrf_k: int = int(os.getenv("RRF_K", "60"))
     rerank_fetch_k: int = int(os.getenv("RERANK_FETCH_K", "12"))
     rate_limit_per_minute: str = os.getenv("RATE_LIMIT_PER_MINUTE", "30/minute")
+    heavy_rate_limit: str = os.getenv("HEAVY_RATE_LIMIT", "5/minute")
     cost_budget_per_query: float = float(os.getenv("COST_BUDGET_PER_QUERY", "0.02"))
+
+    # Ingestion is restricted to paths under this root (prevents arbitrary
+    # file reads via POST /ingest).
+    ingest_root: str = os.getenv("INGEST_ROOT", str(PROJECT_ROOT / "data"))
+
+    # Graph checkpointer backend: "memory" (default — request-scoped runs
+    # never resume threads, so persistence is pure write overhead) or
+    # "sqlite" for durable checkpoints.
+    graph_checkpointer: str = os.getenv("GRAPH_CHECKPOINTER", "memory")
 
     # Phase 9: Circuit breaker
     circuit_breaker_threshold: int = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"))
@@ -98,6 +108,17 @@ class Settings:
 
     # Phase 11: Intent Detection
     intent_detection_enabled: bool = os.getenv("INTENT_DETECTION_ENABLED", "true").lower() == "true"
+
+    # Unified query analysis: one structured LLM call replaces the
+    # intent_detect -> query_transform -> planner chain (3 calls),
+    # cutting ~2-4s latency and ~30-40% of per-query LLM cost.
+    unified_analysis: bool = os.getenv("UNIFIED_ANALYSIS", "false").lower() == "true"
+
+    # Critic mode: "always" verifies every answer (default), "adaptive"
+    # skips verification when the grader passed and the answer is short
+    # (low hallucination risk), "off" disables the critic entirely.
+    critic_mode: str = os.getenv("CRITIC_MODE", "always")
+    critic_skip_max_chars: int = int(os.getenv("CRITIC_SKIP_MAX_CHARS", "600"))
 
     # Phase 12: Query Transformer
     query_transform_enabled: bool = os.getenv("QUERY_TRANSFORM_ENABLED", "true").lower() == "true"
@@ -152,6 +173,10 @@ class Settings:
             raise ValueError(f"cost_alert_threshold must be positive, got {self.cost_alert_threshold}")
         if self.max_upload_size_mb <= 0:
             raise ValueError(f"max_upload_size_mb must be positive, got {self.max_upload_size_mb}")
+        if self.critic_mode.lower() not in {"always", "adaptive", "off"}:
+            raise ValueError(
+                f"Invalid CRITIC_MODE {self.critic_mode!r}. Choose from: always, adaptive, off"
+            )
         if self.langsmith_tracing.lower() == "true" and not self.langsmith_api_key:
             logging.getLogger(__name__).warning(
                 "LANGSMITH_TRACING is enabled but LANGSMITH_API_KEY is not set — "

@@ -18,6 +18,15 @@ import requests
 import streamlit as st
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+# API key for authenticating against the backend when AUTH_ENABLED=true.
+RAG_API_KEY = os.getenv("RAG_API_KEY", "")
+
+
+def _auth_headers() -> dict[str, str]:
+    """Authorization header for API requests (empty when auth is not configured)."""
+    if RAG_API_KEY:
+        return {"Authorization": f"Bearer {RAG_API_KEY}"}
+    return {}
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -311,6 +320,7 @@ with st.sidebar:
                     f"{API_URL}/upload",
                     files={"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "application/octet-stream")},
                     data={"department": department},
+                    headers=_auth_headers(),
                     timeout=60,
                 )
                 if resp.ok:
@@ -417,6 +427,7 @@ if prompt := st.chat_input("Ask a question about enterprise documents..."):
                         "stream": True,
                         "session_id": st.session_state.session_id,
                     },
+                    headers=_auth_headers(),
                     stream=True,
                     timeout=120,
                 )

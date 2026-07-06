@@ -19,6 +19,7 @@ class RAGState(TypedDict, total=False):
     retries: int                # loop guard
     retriever_strategy: str     # Phase 3: which retrieval strategy to use
     filter: dict[str, str]      # metadata filter for retrieval (e.g. department)
+    top_k: int                  # explicit retrieval k from the API request
     critic_passed: bool         # Phase 4: did the critic verify all claims?
     claims_removed: int         # Phase 4: number of unsupported claims stripped
     # Phase 5: multi-agent decomposition

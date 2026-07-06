@@ -1,8 +1,47 @@
 """Shared fixtures for the test suite."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 from langchain_core.documents import Document
+
+
+@pytest.fixture(autouse=True)
+def _reset_circuit_breakers():
+    """Reset global circuit breakers between tests.
+
+    Breakers are process-global singletons (src.resilience.circuit_breaker).
+    A test that trips one (e.g. the "retrieval" or "llm" breaker) would
+    otherwise leave it OPEN, causing unrelated later tests to short-circuit
+    and fail depending on collection order. Clear before and after each test
+    so runs are order-independent.
+    """
+    from src.resilience.circuit_breaker import reset_all_breakers
+
+    reset_all_breakers()
+    yield
+    reset_all_breakers()
+
+
+@pytest.fixture(autouse=True)
+def _disable_api_rate_limit():
+    """Disable slowapi rate limiting during tests.
+
+    Endpoint limits (e.g. HEAVY_RATE_LIMIT=5/minute on /upload) would
+    otherwise return 429 partway through test modules that call the same
+    endpoint repeatedly. Only touches the limiter if api.app is already
+    imported, so pure unit tests don't pay the FastAPI import cost.
+    """
+    app_module = sys.modules.get("api.app")
+    if app_module is None:
+        yield
+        return
+    limiter = app_module.limiter
+    previous = limiter.enabled
+    limiter.enabled = False
+    yield
+    limiter.enabled = previous
 
 
 @pytest.fixture

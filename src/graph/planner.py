@@ -11,6 +11,7 @@ spanning multiple contracts or departments.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -323,8 +324,12 @@ def process_sub_queries_parallel(state: dict) -> dict:
     sub_answers = [""] * len(sub_questions)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # copy_context propagates LangChain's callback config into worker
+        # threads so sub-query LLM calls are still cost-tracked.
         future_to_idx = {
-            executor.submit(_process_single_sub_query, sq, strategy): i
+            executor.submit(
+                contextvars.copy_context().run, _process_single_sub_query, sq, strategy
+            ): i
             for i, sq in enumerate(sub_questions)
         }
         for future in as_completed(future_to_idx):

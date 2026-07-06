@@ -52,6 +52,7 @@ from src.graph.planner import (
     route_after_plan,
     synthesize,
 )
+from src.graph.analyzer import analyze_query
 from src.graph.cache_nodes import cache_lookup, cache_store, route_after_cache
 from src.graph.guardrail_node import guardrail_check, route_after_guardrail
 from src.graph.intent_detector import intent_detect
@@ -109,20 +110,30 @@ def build_graph(checkpointer=None):
     # Phase 8: scope detection (before planner)
     builder.add_node("scope_check", scope_check)
 
+    # Unified analysis (opt-in): one structured LLM call replaces
+    # intent_detect -> query_transform -> planner. When enabled, those three
+    # nodes are not added; analyze_query takes the planner's routing role.
+    _unified = settings.unified_analysis
+
     # Phase 11: intent detection (after scope check, before planner)
-    if settings.intent_detection_enabled:
+    if settings.intent_detection_enabled and not _unified:
         builder.add_node("intent_detect", intent_detect)
 
     # Phase 12: query transformation (after intent detect, before planner)
-    if settings.query_transform_enabled:
+    if settings.query_transform_enabled and not _unified:
         builder.add_node("query_transform", query_transform_node)
 
     # Phase 8: tool routing (optional, gated by ENABLE_TOOLS)
     if settings.enable_tools:
         builder.add_node("tool_router", tool_router)
 
-    # Phase 5: planner and multi-part processing nodes
-    builder.add_node("planner", planner)
+    # Phase 5: planner and multi-part processing nodes. The planner-role node
+    # is analyze_query when unified analysis is on, else the classic planner.
+    _planner_node = "analyze_query" if _unified else "planner"
+    if _unified:
+        builder.add_node("analyze_query", analyze_query)
+    else:
+        builder.add_node("planner", planner)
     if settings.parallel_sub_queries:
         builder.add_node("process_sub_queries_parallel", process_sub_queries_parallel)
     else:
@@ -179,12 +190,12 @@ def build_graph(checkpointer=None):
     # Determine the node that follows scope_check (in-scope path)
     # Chain: scope_check → [intent_detect] → [query_transform] → [tool_router] → planner
     # Build the chain from right to left to find the first enabled node
-    _chain: list[str] = ["planner"]
+    _chain: list[str] = [_planner_node]
     if settings.enable_tools:
         _chain.insert(0, "tool_router")
-    if settings.query_transform_enabled:
+    if settings.query_transform_enabled and not _unified:
         _chain.insert(0, "query_transform")
-    if settings.intent_detection_enabled:
+    if settings.intent_detection_enabled and not _unified:
         _chain.insert(0, "intent_detect")
 
     # First node in the chain is what scope_check routes to
@@ -205,7 +216,7 @@ def build_graph(checkpointer=None):
     # Route multi-part questions to parallel or sequential processing
     _multi_part_target = "process_sub_queries_parallel" if settings.parallel_sub_queries else "process_sub_query"
     builder.add_conditional_edges(
-        "planner",
+        _planner_node,
         route_after_plan,
         {
             "retrieve": "retrieve",                       # simple question → existing CRAG
@@ -256,7 +267,17 @@ def build_graph(checkpointer=None):
     else:
         builder.add_edge("critic", END)
 
-    return builder.compile(checkpointer=checkpointer or _get_sqlite_checkpointer())
+    if checkpointer is None:
+        # Request-scoped invocations use a fresh thread_id every time and
+        # never resume, so durable checkpoints are pure write overhead —
+        # full state (including Documents) would be serialized to SQLite at
+        # every super-step. Default to in-memory; opt into SQLite via
+        # GRAPH_CHECKPOINTER=sqlite for flows that genuinely resume threads.
+        if settings.graph_checkpointer.lower() == "sqlite":
+            checkpointer = _get_sqlite_checkpointer()
+        else:
+            checkpointer = InMemorySaver()
+    return builder.compile(checkpointer=checkpointer)
 
 
 def get_graph(checkpointer=None):
@@ -303,6 +324,9 @@ def ask(
     config = {"configurable": {"thread_id": tid}, "callbacks": [handler]}
 
     try:
+        from src.graph.tracing import start_run_capture
+
+        start_run_capture()  # scope node latencies to this run
         start = time.perf_counter()
         result = graph.invoke(
             {"question": question, "retries": 0, "retriever_strategy": retriever_strategy, "session_id": sid},

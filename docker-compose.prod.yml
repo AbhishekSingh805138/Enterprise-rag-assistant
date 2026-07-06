@@ -1,0 +1,65 @@
+# ============================================================
+# Production Docker Compose — Enterprise RAG Assistant
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+# ============================================================
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - chroma_data:/app/chroma_db
+      - checkpoint_data:/app/checkpoints
+      - ./data:/app/data:ro
+    env_file: .env
+    environment:
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-domain.com}
+      - AUTH_ENABLED=true
+      - DEBUG_MODE=false
+      - LOG_LEVEL=WARNING
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --server.enableCORS false
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    # Least privilege: the UI only proxies to the API — it must not receive
+    # the full .env (OPENAI_API_KEY etc.). It needs the API URL and one API
+    # key to authenticate against the API when AUTH_ENABLED=true.
+    environment:
+      - API_URL=http://api:8000
+      - RAG_API_KEY=${RAG_UI_API_KEY:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+volumes:
+  chroma_data:
+    driver: local
+  checkpoint_data:
+    driver: local

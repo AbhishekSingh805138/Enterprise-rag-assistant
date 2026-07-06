@@ -110,7 +110,7 @@ class TestCacheLookup:
             "retriever_strategy": "hybrid",
         })
         mock_cache.lookup.assert_called_once_with(
-            query="Test?", mode="graph", strategy="hybrid",
+            query="Test?", mode="graph", strategy="hybrid", scope="",
         )
 
 
@@ -155,6 +155,7 @@ class TestCacheStore:
             answer="PTO is paid time off.",
             mode="graph",
             strategy="dense",
+            scope="",
         )
 
     @patch("src.cache.semantic_cache.get_cache")

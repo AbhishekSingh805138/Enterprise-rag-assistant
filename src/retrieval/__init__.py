@@ -10,8 +10,8 @@ Strategies:
     multi_query — LLM-generated query variants with union retrieval
     rerank      — Dense retrieval + LLM cross-encoder reranking
 """
-from src.retrieval.factory import get_retriever, STRATEGIES
+from src.retrieval.factory import get_retriever, resolve_strategy, STRATEGIES
 from src.retrieval.normalizer import normalize_query
 from src.retrieval.dept_detector import detect_department
 
-__all__ = ["get_retriever", "STRATEGIES", "normalize_query", "detect_department"]
+__all__ = ["get_retriever", "resolve_strategy", "STRATEGIES", "normalize_query", "detect_department"]

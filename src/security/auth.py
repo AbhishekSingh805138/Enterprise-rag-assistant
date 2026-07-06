@@ -9,13 +9,20 @@ Gated behind AUTH_ENABLED feature flag (default: False).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 
 from fastapi import HTTPException, Request
 
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def api_key_identity(token: str) -> str:
+    """Stable, non-reversible identifier for an API key (for session scoping/audit)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
 def _get_valid_api_keys() -> frozenset[str]:
@@ -63,9 +70,19 @@ async def verify_api_key(request: Request) -> None:
             detail="Authentication is enabled but no API keys are configured.",
         )
 
-    if token not in valid_keys:
+    # Constant-time comparison against every key so response timing does not
+    # reveal whether a prefix matched.
+    matched = False
+    for key in valid_keys:
+        if secrets.compare_digest(token, key):
+            matched = True
+    if not matched:
         logger.warning("Invalid API key attempt from %s", request.client.host if request.client else "unknown")
         raise HTTPException(
             status_code=401,
             detail="Invalid API key.",
         )
+
+    # Expose a non-reversible key identity so endpoints can scope
+    # per-user resources (e.g. conversation sessions) to the caller.
+    request.state.api_key_id = api_key_identity(token)

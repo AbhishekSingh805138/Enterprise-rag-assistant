@@ -15,7 +15,6 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableParallel, RunnablePassthrough
-from langchain_openai import ChatOpenAI
 
 from config import settings
 
@@ -58,14 +57,9 @@ def build_naive_rag_chain(
 ) -> Runnable:
     """Compose the LCEL chain: {context, question} -> prompt -> llm -> str."""
     from src.retrieval import get_retriever
+    from src.llm_pool import get_llm
     retriever = get_retriever(strategy=retriever_strategy, k=k, filter=filter)
-    llm = ChatOpenAI(
-        model=settings.llm_model,
-        temperature=0,
-        api_key=settings.openai_api_key,
-        timeout=settings.llm_timeout,
-        max_retries=settings.llm_max_retries,
-    )
+    llm = get_llm(temperature=0)
 
     context_and_question = RunnableParallel(
         context=retriever | _format_docs,

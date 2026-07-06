@@ -20,7 +20,7 @@ class AskRequest(BaseModel):
     mode: Literal["naive", "graph", "auto"] = "naive"
     retriever_strategy: Literal[
         "dense", "hybrid", "multi_query", "rerank", "hybrid_rerank",
-        "cross_rerank", "hybrid_cross_rerank", "knowledge_graph",
+        "cross_rerank", "hybrid_cross_rerank", "knowledge_graph", "auto",
     ] = "dense"
     filter: dict[str, str] | None = None
     top_k: int | None = Field(None, gt=0)
@@ -91,7 +91,7 @@ class EvalRequest(BaseModel):
     mode: Literal["naive", "graph", "auto"] = "naive"
     retriever_strategy: Literal[
         "dense", "hybrid", "multi_query", "rerank", "hybrid_rerank",
-        "cross_rerank", "hybrid_cross_rerank", "knowledge_graph",
+        "cross_rerank", "hybrid_cross_rerank", "knowledge_graph", "auto",
     ] = "dense"
     limit: int | None = Field(None, gt=0)
 

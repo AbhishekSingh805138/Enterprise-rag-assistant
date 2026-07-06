@@ -9,6 +9,7 @@ negligible (~$0.0001/query at text-embedding-3-small rates) and is excluded.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -63,10 +64,22 @@ def is_idk_response(text: str) -> bool:
     return any(phrase in lower for phrase in IDK_PHRASES)
 
 
+# Models we've already warned about (avoid log spam)
+_warned_unknown_models: set[str] = set()
+
+
 def compute_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     """Compute estimated cost in USD for a single LLM call."""
     costs = MODEL_COSTS.get(model)
     if costs is None:
+        # Silently returning $0 would blind cost monitoring when the model
+        # is changed — warn once per unknown model name.
+        if model and model not in _warned_unknown_models:
+            _warned_unknown_models.add(model)
+            logger.warning(
+                "Model %r not in MODEL_COSTS — its cost will be recorded as $0. "
+                "Add its pricing to src/observability/cost_callback.py.", model,
+            )
         return 0.0
     input_cost, output_cost = costs
     return (prompt_tokens * input_cost + completion_tokens * output_cost) / 1000
@@ -82,6 +95,9 @@ class CostCallbackHandler(BaseCallbackHandler):
         self._prompt_tokens: int = 0
         self._completion_tokens: int = 0
         self._total_cost: float = 0.0
+        # Parallel sub-queries / per-doc grading fire callbacks from
+        # multiple threads — guard the accumulators.
+        self._counter_lock = threading.Lock()
 
     def on_llm_end(
         self,
@@ -116,9 +132,10 @@ class CostCallbackHandler(BaseCallbackHandler):
             completion_tok = token_usage.get("completion_tokens", 0)
             model = response.llm_output.get("model_name", model)
 
-        self._prompt_tokens += prompt_tok
-        self._completion_tokens += completion_tok
-        self._total_cost += compute_cost(model, prompt_tok, completion_tok)
+        with self._counter_lock:
+            self._prompt_tokens += prompt_tok
+            self._completion_tokens += completion_tok
+            self._total_cost += compute_cost(model, prompt_tok, completion_tok)
 
     def flush(
         self,
@@ -132,13 +149,22 @@ class CostCallbackHandler(BaseCallbackHandler):
         node_latencies: dict | None = None,
     ) -> QueryMetrics:
         """Snapshot current totals, reset counters, and return metrics."""
-        metrics = QueryMetrics(
+        with self._counter_lock:
+            prompt_tokens = self._prompt_tokens
+            completion_tokens = self._completion_tokens
+            total_cost = self._total_cost
+            # Reset for next query
+            self._prompt_tokens = 0
+            self._completion_tokens = 0
+            self._total_cost = 0.0
+
+        return QueryMetrics(
             thread_id=thread_id,
             question_preview=question[:200],
-            prompt_tokens=self._prompt_tokens,
-            completion_tokens=self._completion_tokens,
-            total_tokens=self._prompt_tokens + self._completion_tokens,
-            estimated_cost_usd=self._total_cost,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            estimated_cost_usd=total_cost,
             latency_ms=latency_ms,
             retriever_strategy=retriever_strategy,
             mode=mode,
@@ -146,8 +172,3 @@ class CostCallbackHandler(BaseCallbackHandler):
             grader_rejected=grader_rejected,
             node_latencies=node_latencies,
         )
-        # Reset for next query
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_cost = 0.0
-        return metrics

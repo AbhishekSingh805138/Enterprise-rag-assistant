@@ -52,6 +52,15 @@ class SemanticCache:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_CREATE_CACHE_TABLE)
         self._conn.commit()
+        # Migration: scope column isolates cache entries by retrieval filter /
+        # access scope so answers never leak across those boundaries.
+        try:
+            self._conn.execute(
+                "ALTER TABLE semantic_cache ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._embed_fn = embed_fn
         self._lock = threading.Lock()
 
@@ -71,10 +80,14 @@ class SemanticCache:
         threshold: float | None = None,
         mode: str = "",
         strategy: str = "",
+        scope: str = "",
     ) -> str | None:
         """Look up a cached answer for a similar query.
 
-        Returns the cached answer if cosine similarity >= threshold, else None.
+        Only entries whose scope matches exactly are eligible — scope encodes
+        the retrieval filter (e.g. department) so answers never cross
+        access boundaries. Returns the cached answer if cosine similarity
+        >= threshold, else None.
         """
         if not settings.semantic_cache_enabled:
             return None
@@ -94,7 +107,8 @@ class SemanticCache:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, query, answer, embedding, mode, strategy, created_at, ttl "
-                "FROM semantic_cache"
+                "FROM semantic_cache WHERE scope = ?",
+                (scope,),
             ).fetchall()
 
         best_score = 0.0
@@ -139,6 +153,7 @@ class SemanticCache:
         mode: str = "",
         strategy: str = "",
         ttl: int | None = None,
+        scope: str = "",
     ) -> None:
         """Store a query-answer pair in the cache."""
         if not settings.semantic_cache_enabled:
@@ -155,8 +170,8 @@ class SemanticCache:
 
         with self._lock:
             self._conn.execute(
-                "INSERT INTO semantic_cache (query, answer, embedding, mode, strategy, created_at, ttl) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO semantic_cache (query, answer, embedding, mode, strategy, created_at, ttl, scope) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     query,
                     answer,
@@ -165,6 +180,7 @@ class SemanticCache:
                     strategy,
                     datetime.now(timezone.utc).isoformat(),
                     cache_ttl,
+                    scope,
                 ),
             )
             self._conn.commit()

@@ -9,9 +9,11 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -59,6 +61,70 @@ def _safe_error_detail(e: Exception) -> str:
     if settings.debug_mode:
         return str(e)
     return "An internal error occurred. Please try again or contact support."
+
+
+def _scoped_session_id(request: Request, session_id: str | None) -> str | None:
+    """Bind a client-supplied session ID to the caller's API key identity.
+
+    Without this, any caller who guesses another user's session ID gets
+    their conversation history injected into the prompt. When auth is
+    disabled (single-tenant dev mode) the session ID is used as-is.
+    """
+    if not session_id:
+        return None
+    owner = getattr(request.state, "api_key_id", "")
+    if owner:
+        return f"{owner}:{session_id}"
+    return session_id
+
+
+async def _iter_in_thread(sync_iter_factory, request: Request):
+    """Bridge a synchronous generator into an async one, item by item.
+
+    Runs the sync iteration in a worker thread (asyncio.to_thread copies
+    contextvars, so LangChain callbacks and tracing captures propagate)
+    and pushes items onto a bounded queue as they are produced — this is
+    what makes SSE genuinely incremental instead of a burst replay at the
+    end. Stops the producer between items when the client disconnects.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+    stop = threading.Event()
+
+    def _produce():
+        try:
+            for item in sync_iter_factory():
+                if stop.is_set():
+                    break
+                asyncio.run_coroutine_threadsafe(queue.put(("item", item)), loop).result()
+            asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
+        except Exception as exc:  # surfaced to the consumer below
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
+
+    producer = asyncio.create_task(asyncio.to_thread(_produce))
+    try:
+        while True:
+            try:
+                kind, item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if await request.is_disconnected():
+                    return
+                continue
+            if kind == "end":
+                return
+            if kind == "error":
+                raise item
+            yield item
+            if await request.is_disconnected():
+                return
+    finally:
+        stop.set()
+        # Drain so a producer blocked on queue.put can observe the stop flag.
+        while not queue.empty():
+            queue.get_nowait()
+        with contextlib.suppress(Exception):
+            await producer
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -173,18 +239,22 @@ def _resolve_mode(body: AskRequest) -> str:
     return "naive"
 
 
-def _ask_sync(body: AskRequest) -> AskResponse:
-    """Run the query synchronously and return a full AskResponse."""
+def _ask_sync(body: AskRequest, session_id: str | None = None) -> AskResponse:
+    """Run the query synchronously and return a full AskResponse.
+
+    *session_id* is the already-scoped session identifier (bound to the
+    caller's API key by the endpoint).
+    """
     from src.observability.cost_callback import CostCallbackHandler, is_idk_response
 
     resolved_mode = _resolve_mode(body)
     handler = CostCallbackHandler()
     start = time.perf_counter()
     node_latencies = None
-    session_id = body.session_id or None
 
     if resolved_mode == "graph":
         from src.graph.build_graph import get_graph
+        from src.graph.tracing import start_run_capture
 
         graph = get_graph()
         import uuid
@@ -199,6 +269,9 @@ def _ask_sync(body: AskRequest) -> AskResponse:
         }
         if body.filter:
             invoke_state["filter"] = body.filter
+        if body.top_k:
+            invoke_state["top_k"] = body.top_k
+        start_run_capture()  # scope node latencies to this request
         result = graph.invoke(invoke_state, config)
         answer = filter_output(result.get("generation", "No answer was generated."))
 
@@ -247,18 +320,22 @@ def _ask_sync(body: AskRequest) -> AskResponse:
         tokens_used=metrics.total_tokens,
         node_latencies=node_latencies,
         is_idk=is_idk,
-        session_id=session_id,
+        # Echo the client's own session id, not the internally scoped one.
+        session_id=body.session_id,
     )
 
 
-async def _stream_graph(body: AskRequest, request: Request):
+async def _stream_graph(body: AskRequest, request: Request, session_id: str | None = None):
     """Async generator yielding SSE events for graph mode streaming.
 
-    Checks request.is_disconnected() between steps for backpressure —
-    stops work early if the client has gone away.
+    Steps are forwarded to the client as the pipeline produces them (via
+    _iter_in_thread), and the producer is stopped between steps if the
+    client disconnects. All streamed content passes through the PII
+    output filter before leaving the server.
     """
     try:
         from src.observability.cost_callback import CostCallbackHandler
+        from src.graph.tracing import start_run_capture
 
         handler = CostCallbackHandler()
         start = time.perf_counter()
@@ -268,7 +345,7 @@ async def _stream_graph(body: AskRequest, request: Request):
 
         graph = get_graph()
         tid = uuid.uuid4().hex[:12]
-        sid = body.session_id or tid
+        sid = session_id or tid
         config = {"configurable": {"thread_id": tid}, "callbacks": [handler]}
 
         answer = ""
@@ -280,23 +357,27 @@ async def _stream_graph(body: AskRequest, request: Request):
         }
         if body.filter:
             stream_state["filter"] = body.filter
-        for step in await asyncio.to_thread(
-            lambda: list(graph.stream(stream_state, config))
-        ):
-            # Check if client disconnected between steps
-            if await request.is_disconnected():
-                logger.info("Client disconnected during streaming (thread=%s)", tid)
-                return
+        if body.top_k:
+            stream_state["top_k"] = body.top_k
 
+        start_run_capture()  # scope node latencies to this request
+        async for step in _iter_in_thread(
+            lambda: graph.stream(stream_state, config), request
+        ):
             for node_name, state_update in step.items():
                 event = {"type": "status", "node": node_name}
                 if state_update and "generation" in state_update:
-                    answer = state_update["generation"]
+                    # Redact PII before it leaves the server — filtering
+                    # only the final answer would leak via token events.
+                    answer = filter_output(state_update["generation"])
                     event["type"] = "token"
                     event["content"] = answer
                 yield f"data: {json.dumps(event)}\n\n"
 
         latency_ms = (time.perf_counter() - start) * 1000
+        disconnected = await request.is_disconnected()
+        if disconnected:
+            logger.info("Client disconnected during streaming (thread=%s)", tid)
 
         # Capture per-node latencies and IDK status
         from src.observability.cost_callback import is_idk_response
@@ -307,7 +388,6 @@ async def _stream_graph(body: AskRequest, request: Request):
         except Exception:
             pass
 
-        answer = filter_output(answer)
         is_idk = is_idk_response(answer)
         metrics = handler.flush(
             thread_id=tid, question=body.question,
@@ -322,6 +402,9 @@ async def _stream_graph(body: AskRequest, request: Request):
             get_store().record(metrics)
         except Exception:
             pass
+
+        if disconnected:
+            return  # cost is recorded above; no one is listening for events
 
         done_event = {
             "type": "done",
@@ -342,8 +425,10 @@ async def _stream_graph(body: AskRequest, request: Request):
 async def _stream_naive(body: AskRequest, request: Request):
     """Async generator yielding SSE events for naive mode streaming.
 
-    Runs the chain in a thread to avoid blocking the event loop,
-    and checks for client disconnection between chunks.
+    Chunks are forwarded as the LLM produces them (via _iter_in_thread).
+    Each chunk passes through the PII output filter; patterns spanning a
+    chunk boundary are additionally caught by the filtered final answer
+    in the 'done' event.
     """
     from src.observability.cost_callback import CostCallbackHandler
     from src.rag.naive_rag import build_naive_rag_chain
@@ -357,19 +442,17 @@ async def _stream_naive(body: AskRequest, request: Request):
         retriever_strategy=body.retriever_strategy,
     )
 
-    # Collect all chunks in a thread to avoid blocking the event loop
-    chunks = await asyncio.to_thread(
-        lambda: list(chain.stream(body.question, config={"callbacks": [handler]}))
-    )
-
     parts: list[str] = []
-    for chunk in chunks:
-        if await request.is_disconnected():
-            logger.info("Client disconnected during naive streaming")
-            return
+    async for chunk in _iter_in_thread(
+        lambda: chain.stream(body.question, config={"callbacks": [handler]}), request
+    ):
         parts.append(chunk)
-        event = {"type": "token", "content": chunk}
+        event = {"type": "token", "content": filter_output(chunk)}
         yield f"data: {json.dumps(event)}\n\n"
+
+    if await request.is_disconnected():
+        logger.info("Client disconnected during naive streaming")
+        return
 
     full_answer = filter_output("".join(parts))
     latency_ms = (time.perf_counter() - start) * 1000
@@ -412,14 +495,22 @@ async def ask_endpoint(request: Request, body: AskRequest):
     if not guardrail.safe:
         raise HTTPException(status_code=400, detail=guardrail.reason)
 
+    # Bind the session to the caller's API key so one client cannot read
+    # another client's conversation history by guessing session IDs.
+    scoped_session = _scoped_session_id(request, body.session_id)
+
     try:
         if body.stream:
             resolved = _resolve_mode(body)
-            gen = _stream_graph(body, request) if resolved == "graph" else _stream_naive(body, request)
+            gen = (
+                _stream_graph(body, request, session_id=scoped_session)
+                if resolved == "graph"
+                else _stream_naive(body, request)
+            )
             return StreamingResponse(gen, media_type="text/event-stream")
 
         # Run sync pipeline in a thread to avoid blocking the event loop
-        return await asyncio.to_thread(_ask_sync, body)
+        return await asyncio.to_thread(_ask_sync, body, scoped_session)
     except Exception as e:
         logger.exception("Ask endpoint failed")
         raise HTTPException(status_code=500, detail=_safe_error_detail(e))
@@ -452,10 +543,27 @@ def _ingest_sync(body: IngestRequest) -> IngestResponse:
     )
 
 
+def _validate_ingest_path(raw_path: str) -> None:
+    """Reject paths outside the configured ingest root.
+
+    Without this check, /ingest is an arbitrary-file-read primitive: any
+    .pdf/.txt/.md on the server could be ingested and then queried.
+    """
+    root = Path(settings.ingest_root).resolve()
+    target = Path(raw_path).resolve()
+    if target != root and root not in target.parents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Path must be inside the ingest root ({settings.ingest_root}).",
+        )
+
+
 @app.post("/ingest", response_model=IngestResponse, responses={400: {"model": ErrorResponse}},
            dependencies=[Depends(verify_api_key)])
-async def ingest_endpoint(body: IngestRequest):
-    """Ingest documents from a file or directory path."""
+@limiter.limit(settings.heavy_rate_limit)
+async def ingest_endpoint(request: Request, body: IngestRequest):
+    """Ingest documents from a file or directory path under the ingest root."""
+    _validate_ingest_path(body.path)
     try:
         return await asyncio.to_thread(_ingest_sync, body)
     except FileNotFoundError as e:
@@ -487,7 +595,8 @@ def _sanitize_filename(name: str) -> str:
 
 @app.post("/upload", response_model=UploadResponse, responses={400: {"model": ErrorResponse}},
            dependencies=[Depends(verify_api_key)])
-async def upload_endpoint(file: UploadFile, department: str = "general"):
+@limiter.limit(settings.heavy_rate_limit)
+async def upload_endpoint(request: Request, file: UploadFile, department: str = "general"):
     """Upload a document file (PDF, TXT, or MD) and ingest it into the vector store."""
     from api.models import VALID_DEPARTMENTS
 
@@ -605,7 +714,8 @@ async def tools_endpoint():
 
 
 @app.post("/eval", response_model=EvalResponse, dependencies=[Depends(verify_api_key)])
-async def eval_endpoint(body: EvalRequest):
+@limiter.limit(settings.heavy_rate_limit)
+async def eval_endpoint(request: Request, body: EvalRequest):
     """Run the RAGAS evaluation suite. This is a long-running operation."""
     try:
         from src.eval.ragas_eval import evaluate, load_eval_set

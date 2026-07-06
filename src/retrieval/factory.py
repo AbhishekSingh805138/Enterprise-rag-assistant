@@ -79,6 +79,31 @@ _REGISTRY: dict[str, Callable] = {
 
 STRATEGIES = tuple(_REGISTRY.keys())
 
+# Intent-based routing for the "auto" strategy:
+#   factual        — precise single-fact lookup: dense similarity suffices
+#   comparative /
+#   analytical     — answer quality depends on ranking: full hybrid + rerank
+#   everything else — hybrid for keyword+semantic recall
+_INTENT_STRATEGY: dict[str, str] = {
+    "factual": "dense",
+    "informational": "hybrid",
+    "procedural": "hybrid",
+    "multi_hop": "hybrid",
+    "comparative": "hybrid_cross_rerank",
+    "analytical": "hybrid_cross_rerank",
+}
+_AUTO_DEFAULT = "hybrid"
+
+
+def resolve_strategy(strategy: str, intent: str | None = None) -> str:
+    """Resolve the "auto" strategy to a concrete one based on query intent.
+
+    Concrete strategy names pass through unchanged.
+    """
+    if strategy != "auto":
+        return strategy
+    return _INTENT_STRATEGY.get((intent or "").lower(), _AUTO_DEFAULT)
+
 
 def register_strategy(name: str, builder: Callable) -> None:
     """Register a custom retrieval strategy at runtime."""
@@ -91,17 +116,20 @@ def get_retriever(
     strategy: str = "dense",
     k: int | None = None,
     filter: dict | None = None,
+    intent: str | None = None,
 ) -> BaseRetriever:
     """Return a retriever for the given strategy.
 
     Args:
-        strategy: One of STRATEGIES.
+        strategy: One of STRATEGIES, or "auto" to route by intent.
         k: Number of final documents to return.
         filter: Metadata filter dict (passed to dense retrievers).
+        intent: Query intent used to resolve the "auto" strategy.
 
     Returns:
         A LangChain BaseRetriever.
     """
+    strategy = resolve_strategy(strategy, intent)
     builder = _REGISTRY.get(strategy)
     if builder is None:
         raise ValueError(

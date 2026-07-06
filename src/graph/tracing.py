@@ -8,6 +8,14 @@ Phase 8 additions:
   - Module-level metric accumulator for per-node latency percentiles
   - get_node_metrics() / reset_node_metrics() for observability
 
+Concurrency-safety additions:
+  - Global accumulator is bounded (deque) so a long-running server does
+    not leak memory.
+  - start_run_capture() opens a per-request capture via a ContextVar so
+    get_last_run_latencies() returns THIS request's node timings even
+    when other requests run concurrently. Without an active capture it
+    falls back to the most recent global value per node.
+
 Usage:
     from src.graph.tracing import traced
 
@@ -22,13 +30,35 @@ import logging
 import statistics
 import threading
 import time
+from collections import deque
+from contextvars import ContextVar
 from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# Module-level accumulator: node_name -> list of elapsed_ms values
-_node_metrics: dict[str, list[float]] = {}
+# Keep at most this many samples per node for percentile stats.
+_MAX_SAMPLES = 1000
+
+# Module-level accumulator: node_name -> bounded deque of elapsed_ms values
+_node_metrics: dict[str, deque[float]] = {}
 _lock = threading.Lock()
+
+# Per-request capture. The dict is created by start_run_capture() and
+# mutated in place by traced() — threads that inherit a copy of the
+# context (e.g. via asyncio.to_thread) share the same dict object.
+_run_capture: ContextVar[dict[str, float] | None] = ContextVar(
+    "node_run_capture", default=None
+)
+
+
+def start_run_capture() -> None:
+    """Begin capturing node latencies for the current request/context.
+
+    Call immediately before graph.invoke()/graph.stream() in the same
+    thread or task; get_last_run_latencies() afterwards returns only the
+    latencies recorded since this call.
+    """
+    _run_capture.set({})
 
 
 def get_node_metrics() -> dict[str, dict]:
@@ -37,8 +67,11 @@ def get_node_metrics() -> dict[str, dict]:
     Returns a dict like:
         {"retrieve": {"count": 10, "p50": 120.0, "p95": 340.0, "p99": 500.0}, ...}
     """
+    with _lock:
+        snapshot = {name: list(timings) for name, timings in _node_metrics.items()}
+
     result = {}
-    for name, timings in _node_metrics.items():
+    for name, timings in snapshot.items():
         n = len(timings)
         if n == 0:
             continue
@@ -55,12 +88,21 @@ def get_node_metrics() -> dict[str, dict]:
 
 
 def get_last_run_latencies() -> dict[str, float]:
-    """Return the most recent latency for each node (for API response)."""
-    return {
-        name: round(timings[-1], 1)
-        for name, timings in _node_metrics.items()
-        if timings
-    }
+    """Return the current request's per-node latencies.
+
+    If a capture was started via start_run_capture(), returns exactly the
+    nodes recorded in this request. Otherwise falls back to the most
+    recent global value per node (single-threaded/testing use).
+    """
+    captured = _run_capture.get()
+    if captured is not None:
+        return {name: round(ms, 1) for name, ms in captured.items()}
+    with _lock:
+        return {
+            name: round(timings[-1], 1)
+            for name, timings in _node_metrics.items()
+            if timings
+        }
 
 
 def reset_node_metrics() -> None:
@@ -89,9 +131,16 @@ def traced(fn: Callable[[dict], dict]) -> Callable[[dict], dict]:
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        # Record metric (thread-safe)
+        # Record global metric (thread-safe, bounded)
         with _lock:
-            _node_metrics.setdefault(node_name, []).append(elapsed_ms)
+            _node_metrics.setdefault(
+                node_name, deque(maxlen=_MAX_SAMPLES)
+            ).append(elapsed_ms)
+
+        # Record into the per-request capture if one is active
+        captured = _run_capture.get()
+        if captured is not None:
+            captured[node_name] = elapsed_ms
 
         # Log output summary
         n_docs_out = len(result.get("documents", []))

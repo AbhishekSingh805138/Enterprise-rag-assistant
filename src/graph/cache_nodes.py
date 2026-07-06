@@ -5,12 +5,25 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from config import settings
 from src.graph.tracing import traced
 
 logger = logging.getLogger(__name__)
+
+
+def _cache_scope(state: dict) -> str:
+    """Serialize the retrieval filter into a stable cache scope key.
+
+    Queries with different metadata filters (e.g. department) must never
+    share cache entries — that would bypass access boundaries.
+    """
+    filter_dict = state.get("filter") or {}
+    if not filter_dict:
+        return ""
+    return json.dumps(dict(sorted(filter_dict.items())), sort_keys=True)
 
 
 @traced
@@ -25,6 +38,12 @@ def cache_lookup(state: dict) -> dict:
     if not question.strip():
         return {"cache_hit": False}
 
+    # Skip the cache for follow-up turns: the same question text can mean
+    # something different depending on conversation history.
+    if state.get("memory_context"):
+        logger.debug("Cache skipped — conversation context present")
+        return {"cache_hit": False}
+
     try:
         from src.cache.semantic_cache import get_cache
 
@@ -33,6 +52,7 @@ def cache_lookup(state: dict) -> dict:
             query=question,
             mode="graph",
             strategy=strategy,
+            scope=_cache_scope(state),
         )
 
         if cached_answer is not None:
@@ -53,11 +73,18 @@ def cache_store(state: dict) -> dict:
     if not settings.semantic_cache_enabled:
         return {}
 
-    question = state.get("question", "")
+    # Store under the user's original question (query rewrites may have
+    # replaced state["question"]) so lookup and store keys match.
+    question = state.get("original_question") or state.get("question", "")
     generation = state.get("generation", "")
     strategy = state.get("retriever_strategy", "dense")
 
     if not question.strip() or not generation.strip():
+        return {}
+
+    # Answers shaped by conversation history are not reusable across sessions.
+    if state.get("memory_context"):
+        logger.debug("Cache store skipped — conversation context present")
         return {}
 
     # Don't cache IDK responses
@@ -75,6 +102,7 @@ def cache_store(state: dict) -> dict:
             answer=generation,
             mode="graph",
             strategy=strategy,
+            scope=_cache_scope(state),
         )
         logger.debug("Cached answer for: %s", question[:80])
     except Exception:

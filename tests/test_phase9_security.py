@@ -38,6 +38,7 @@ def client():
         mock_settings.cors_origins = "http://localhost:8501"
         mock_settings.cors_allow_methods = "GET,POST,OPTIONS"
         mock_settings.cors_allow_headers = "Content-Type,Authorization,X-Request-ID"
+        mock_settings.ingest_root = "./data"
 
         from api.app import app
         with TestClient(app) as tc:

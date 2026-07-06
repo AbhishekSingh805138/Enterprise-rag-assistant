@@ -346,6 +346,7 @@ class TestGraphStateSmoke:
         expected = {
             "question", "documents", "relevant", "web_fallback_used",
             "generation", "retries", "retriever_strategy", "filter",
+            "top_k",  # explicit retrieval k from the API request
             "critic_passed", "claims_removed",
             # Phase 5: multi-agent decomposition
             "original_question", "sub_questions", "sub_answers",

@@ -9,6 +9,7 @@ boolean rather than free text you have to parse.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -40,7 +41,10 @@ def _llm(temperature: float = 0) -> ChatOpenAI:
 def retrieve(state: dict) -> dict:
     """Retrieve documents for the current question."""
     question = state["question"]
-    strategy = state.get("retriever_strategy", "dense")
+    from src.retrieval.factory import resolve_strategy
+    strategy = resolve_strategy(
+        state.get("retriever_strategy", "dense"), state.get("intent")
+    )
 
     # Phase 12: use transformed query if available, else normalize inline
     transformed = state.get("transformed_query", "")
@@ -59,9 +63,9 @@ def retrieve(state: dict) -> dict:
             filter_dict = {"department": dept}
             logger.info("Auto-detected department: %s", dept)
 
-    # Phase 8: adaptive top_k based on query length
-    k = None
-    if settings.adaptive_k:
+    # Explicit top_k from the API request wins over adaptive heuristics
+    k = state.get("top_k")
+    if k is None and settings.adaptive_k:
         word_count = len(normalized.split())
         if word_count <= 5:
             k = settings.adaptive_k_min
@@ -167,8 +171,12 @@ def grade_documents(state: dict) -> dict:
             relevant_docs = []
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # copy_context propagates LangChain's callback config into
+                # worker threads so token usage is still cost-tracked.
                 futures = {
-                    executor.submit(_grade_single_doc, question, doc): doc
+                    executor.submit(
+                        contextvars.copy_context().run, _grade_single_doc, question, doc
+                    ): doc
                     for doc in documents
                 }
                 for future in as_completed(futures):
@@ -207,11 +215,16 @@ def grade_documents(state: dict) -> dict:
         logger.info("Grader verdict: relevant=%s", verdict.relevant)
         return {"relevant": verdict.relevant}
     except CircuitBreakerOpen as exc:
+        # LLM is down — the rewrite/retry path would also fail, so don't take it.
         logger.warning("LLM circuit open during grading: %s", exc)
         return {"relevant": False}
     except Exception:
-        logger.exception("Grading failed — defaulting to relevant=False for safety")
-        return {"relevant": False}
+        # A grader error is not evidence the documents are bad. Returning
+        # False here would trigger the expensive rewrite→retry→web-search
+        # path on a transient failure. Proceed to generation — the critic
+        # still verifies claims against the sources.
+        logger.exception("Grading failed — proceeding to generation (critic will verify)")
+        return {"relevant": True}
 
 
 # --- Node: transform query (corrective step) -------------------------------
@@ -524,6 +537,25 @@ def critic(state: dict) -> dict:
     if not documents:
         logger.warning("Critic: no source documents to verify against")
         return {"critic_passed": True, "claims_removed": 0}
+
+    # Critic mode gating: verification costs 1-2 extra LLM round-trips.
+    mode = settings.critic_mode.lower()
+    if mode == "off":
+        return {"critic_passed": True, "claims_removed": 0}
+    if mode == "adaptive":
+        # Skip only low-risk answers: the grader vouched for the context,
+        # nothing came from the web, it isn't a multi-source synthesis,
+        # and the answer is short. Everything else is still verified.
+        if (
+            state.get("relevant")
+            and not state.get("web_fallback_used")
+            and not state.get("is_multi_part")
+            and len(generation) <= settings.critic_skip_max_chars
+        ):
+            logger.info(
+                "Critic: skipped (adaptive) — grader passed, %d chars", len(generation)
+            )
+            return {"critic_passed": True, "claims_removed": 0}
 
     try:
         context = "\n\n".join(

@@ -82,17 +82,26 @@ class TestConfigPhase8:
 class TestLLMTimeout:
     """Verify _llm() passes timeout and max_retries from settings."""
 
-    @patch("src.graph.nodes.settings")
+    @patch("src.llm_pool.settings")
     def test_nodes_llm_passes_timeout(self, mock_settings):
+        # _llm() delegates to the llm_pool, which reads src.llm_pool.settings
+        # at instance-creation time and caches by (model, temperature) —
+        # so patch the pool's settings and reset the pool around the test.
         mock_settings.llm_model = "gpt-4o-mini"
         mock_settings.openai_api_key = "sk-test"
         mock_settings.llm_timeout = 45
         mock_settings.llm_max_retries = 3
 
+        from src.llm_pool import reset_pool
         from src.graph.nodes import _llm
-        llm = _llm()
-        assert llm.request_timeout == 45
-        assert llm.max_retries == 3
+
+        reset_pool()
+        try:
+            llm = _llm()
+            assert llm.request_timeout == 45
+            assert llm.max_retries == 3
+        finally:
+            reset_pool()  # don't leak the mocked instance to other tests
 
     @patch("src.graph.nodes.settings")
     def test_nodes_llm_default_temperature(self, mock_settings):
@@ -122,11 +131,16 @@ class TestLLMTimeout:
 # ---------------------------------------------------------------------------
 
 class TestGraderErrorDefault:
-    """Verify grader returns relevant=False on exception (not True)."""
+    """Verify grader proceeds to generation (relevant=True) on transient errors.
+
+    A grader exception is not evidence the documents are bad — defaulting
+    to False would trigger the expensive rewrite→retry→web-search path on
+    a transient failure. The critic still verifies claims downstream.
+    """
 
     @patch("src.graph.nodes._llm")
-    def test_grader_returns_false_on_exception(self, mock_llm):
-        """When the grading chain raises, grade_documents should default to relevant=False."""
+    def test_grader_returns_true_on_exception(self, mock_llm):
+        """When the grading chain raises, grade_documents should proceed to generate."""
         # Make with_structured_output return a chain whose invoke raises
         mock_structured = MagicMock()
         mock_structured.invoke.side_effect = RuntimeError("LLM is down")
@@ -148,7 +162,7 @@ class TestGraderErrorDefault:
                 "documents": [Document(page_content="some content")],
             }
             result = grade_documents(state)
-            assert result["relevant"] is False
+            assert result["relevant"] is True
 
     def test_grader_returns_false_on_empty_docs(self):
         """No documents -> relevant=False (no LLM call needed)."""

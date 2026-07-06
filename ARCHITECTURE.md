@@ -300,6 +300,40 @@ Optimal:  Query -> embed -> FAISS.search(q, k=1) -> threshold check
 
 ---
 
+### 2.3 Hardening Applied (2026-07)
+
+The following production gaps were identified in review and fixed:
+
+| Fix | Where |
+|-----|-------|
+| `/ingest` restricted to `INGEST_ROOT` (was an arbitrary-file-read primitive) | `api/app.py`, `config.py` |
+| Sessions bound to API-key identity (was: any caller could read any session by guessing its ID) | `api/app.py`, `src/security/auth.py` |
+| Semantic cache scoped by retrieval filter; skipped for conversation-context turns; keyed on original question | `src/cache/semantic_cache.py`, `src/graph/cache_nodes.py` |
+| SSE streaming is genuinely incremental (was: full pipeline ran, then a burst replay) and all streamed content passes the PII filter | `api/app.py` |
+| Per-request node latencies are context-scoped (was: cross-contaminated under concurrency) and the global accumulator is bounded (was: memory leak) | `src/graph/tracing.py` |
+| Cost tracking propagates into parallel sub-query / per-doc grading threads via `contextvars.copy_context` | `src/graph/planner.py`, `src/graph/nodes.py` |
+| Grader errors no longer trigger the rewrite→retry→web-search path (critic still verifies) | `src/graph/nodes.py` |
+| Rate limits on `/ingest`, `/upload`, `/eval` (`HEAVY_RATE_LIMIT`) | `api/app.py` |
+| Constant-time API key comparison | `src/security/auth.py` |
+| Default checkpointer is in-memory (`GRAPH_CHECKPOINTER=sqlite` to opt back in) — request-scoped runs never resume threads | `src/graph/build_graph.py` |
+| Prod runs 1 uvicorn worker with `--proxy-headers` (process-local rate limits/breakers/caches diverge across workers); UI container no longer receives the full `.env` | `Dockerfile.prod`, `docker-compose.prod.yml` |
+| `top_k` honored in graph mode; unknown LLM models warn instead of silently costing $0 | `src/graph/nodes.py`, `src/observability/cost_callback.py` |
+
+---
+
+### 2.4 Latency / Cost Optimizations (opt-in)
+
+Per-query the pipeline made 6-8 serial LLM calls. Two opt-in flags cut that
+down; both default off so behavior is unchanged unless enabled.
+
+| Flag | Effect | Where |
+|------|--------|-------|
+| `UNIFIED_ANALYSIS=true` | One structured LLM call replaces `intent_detect` → `query_transform` → `planner` (intent + entities + query rewrite + decomposition in a single pass), removing 2 serial round-trips. Falls back to the same zero-LLM heuristics on error/circuit-open. | `src/graph/analyzer.py`, `src/graph/build_graph.py` |
+| `CRITIC_MODE=adaptive` | Skips claim-verification (1-2 LLM calls) for low-risk answers — grader passed, no web fallback, not multi-part, and shorter than `CRITIC_SKIP_MAX_CHARS`. `always` (default) verifies everything; `off` disables the critic. | `src/graph/nodes.py`, `config.py` |
+| `retriever_strategy="auto"` | `resolve_strategy` routes by intent: `factual`→dense, `comparative`/`analytical`→hybrid+rerank, else hybrid. | `src/retrieval/factory.py` |
+
+---
+
 ## 3. Production Gap Analysis
 
 ### Critical Gaps
