@@ -1,8 +1,8 @@
 # Enterprise RAG Assistant
 
-A production-grade **Retrieval-Augmented Generation (RAG)** system built for enterprise document intelligence. Features a Corrective RAG (CRAG) pipeline with LangGraph orchestration, 8 retrieval strategies, multi-agent question decomposition, conversation memory, knowledge graph, and a full security layer.
+A production-grade **Retrieval-Augmented Generation (RAG)** system built for enterprise document intelligence. Features a Corrective RAG (CRAG) pipeline with LangGraph orchestration, 8 retrieval strategies, multi-agent question decomposition, conversation memory, knowledge graph, an event-driven ingestion pipeline, and a full security layer.
 
-**Tech Stack**: LangChain 1.0 | LangGraph 1.0 | ChromaDB | OpenAI | FastAPI | Streamlit
+**Tech Stack**: LangChain 1.0 | LangGraph 1.0 | ChromaDB | OpenAI | FastAPI | Streamlit | Kafka | S3
 
 ---
 
@@ -20,6 +20,7 @@ A production-grade **Retrieval-Augmented Generation (RAG)** system built for ent
 - [Docker Deployment](#docker-deployment)
 - [API Reference](#api-reference)
 - [CLI Tools](#cli-tools)
+- [Async Ingestion](#async-ingestion)
 - [Testing](#testing)
 - [Evaluation](#evaluation)
 - [Security](#security)
@@ -49,6 +50,15 @@ A production-grade **Retrieval-Augmented Generation (RAG)** system built for ent
 - **Multi-turn memory**: SQLite-backed conversation history with session management and token-budgeted context
 - **Semantic cache**: Cosine similarity matching (threshold 0.95) for instant responses on repeated queries
 
+### Ingestion Pipeline
+- **Event-driven ingestion**: `POST /upload` stores the file durably, publishes an event and returns `202` — parsing and embedding happen on a separate worker, off the request path
+- **Content-addressed idempotency**: `sha256(bytes)` + department derives the document ID, so a repeat upload is rejected before any parse or embed cost is paid
+- **Retry with backoff, then DLQ**: transient failures retried up to 3 times; permanent ones (corrupt file, missing object) dead-lettered immediately instead of burning the budget
+- **Crash recovery**: visibility timeouts redeliver events abandoned by a killed worker; stale `PROCESSING` claims are reclaimable so documents are never stranded
+- **Pluggable backends**: object storage (`local` / `s3`+MinIO) and event bus (`sqlite` / `kafka`) — the defaults need no broker, so CI exercises the same retry and DLQ code production runs
+- **Lifecycle visibility**: `GET /documents/{id}` reports `PENDING → PROCESSING → PROCESSED / FAILED / DEAD_LETTER`
+- **File types**: PDF, DOCX, CSV, TXT, Markdown
+
 ### Security & Guardrails
 - **API authentication**: Static API keys or JWT token validation
 - **Input guardrails**: Prompt injection detection (11 regex patterns), PII detection (SSN, credit card, phone, email), max query length enforcement
@@ -63,52 +73,72 @@ A production-grade **Retrieval-Augmented Generation (RAG)** system built for ent
 ### Observability
 - **Cost & token tracking**: Per-query cost calculation via LangChain callbacks
 - **Latency metrics**: Per-node timing with SQLite persistence
-- **Health checks**: Deep subsystem checks (ChromaDB, SQLite, LLM availability)
+- **Health checks**: Deep subsystem checks (ChromaDB, SQLite, object store, queue backlog, DLQ depth)
+- **Request tracing**: `X-Request-ID` propagated from the API through the queue into the worker
+- **Structured logging**: `JSON_LOGS=true` emits one JSON object per line with the request ID attached
 - **LangSmith integration**: Optional distributed tracing
 
 ### API & UI
-- **FastAPI REST API**: 6 endpoints with SSE streaming, CORS, rate limiting
+- **FastAPI REST API**: 8 endpoints with SSE streaming, CORS, rate limiting
 - **Streamlit chat UI**: Dark theme, session persistence, pipeline progress visualization, file upload
-- **Docker support**: Multi-service compose with health checks
+- **Docker support**: Multi-service compose with health checks; production topology adds Kafka, MinIO and scalable ingestion workers
 
 ---
 
 ## Architecture Overview
 
+The system has two independent paths: a **query path** that answers questions,
+and an **ingestion path** that gets documents into the vector store. They meet
+only at ChromaDB, so indexing a 200-page PDF never slows down a chat request.
+
 ```
 +------------------+     +---------------------------+     +----------------+
 | Streamlit UI     |     | FastAPI API Layer          |     | OpenAI API     |
 | - Chat interface |---->| - POST /ask (SSE stream)   |---->| gpt-4o-mini    |
-| - File upload    |     | - POST /ingest             |     | text-embedding |
-| - Session mgmt   |     | - POST /upload  (202)      |     | -3-small       |
-+------------------+     | - GET  /documents/{id}     |     +----------------+
-                          | - POST /eval               |     | Tavily API     |
-                          | - GET  /health             |     | (web fallback) |
-                          | - GET  /tools              |     +----------------+
-                          +---------------------------+
-                                     |
-                     Async ingestion (ASYNC_INGESTION=true)
-                                     |
-                    object store  ->  queue  ->  worker  ->  vector DB
-                    (S3/local)       (Kafka/    (retry x3
-                                      SQLite)    -> DLQ)
-                                     |
-                    +----------------+------------------+
-                    |                                   |
-              Security Layer                    Rate Limiting
-         (Auth + Guardrails + PII)             (30 req/min)
-                    |
-                    v
-          LangGraph CRAG Pipeline
-          (see Pipeline Flow below)
-                    |
-          +---------+---------+-----------+
-          |         |         |           |
-       ChromaDB  SQLite    NetworkX   BM25Okapi
-       (vectors) (memory,  (knowledge  (sparse
-                  metrics,  graph)     retrieval)
+| - File upload    |     | - POST /upload      (202)  |     | text-embedding |
+| - Session mgmt   |     | - GET  /documents/{id}     |     | -3-small       |
++------------------+     | - POST /ingest             |     +----------------+
+                         | - POST /eval               |     | Tavily API     |
+                         | - GET  /health /tools      |     | (web fallback) |
+                         +-------------+-------------+     +----------------+
+                                       |
+              +------------------------+------------------------+
+              |                                                 |
+        QUERY PATH  /ask                              INGESTION PATH  /upload
+              |                                                 |
+              v                                                 v
+    Security Layer + Rate Limiting                 Validate -> checksum ->
+    (Auth, Guardrails, PII, 30/min)                idempotency check
+              |                                                 |
+              v                                    +------------+------------+
+    LangGraph CRAG Pipeline                        | exists? -> 200 + same   |
+    (see Pipeline Flow below)                      |            document_id  |
+              |                                    +------------+------------+
+              |                                                 | new
+              |                                                 v
+              |                                    Object Store (S3 / local)
+              |                                                 |
+              |                                                 v
+              |                                    Event Queue (Kafka / SQLite)
+              |                                       topic: document.uploaded
+              |                                                 |
+              |                                                 v
+              |                                    Ingestion Worker(s)  x N
+              |                                    parse -> chunk -> embed
+              |                                    retry x3 -> DLQ on failure
+              |                                                 |
+              +--------------------+----------------------------+
+                                   v
+          +---------+---------+-----------+------------------+
+          |         |         |           |                  |
+       ChromaDB  SQLite    NetworkX   BM25Okapi        Document Registry
+       (vectors) (memory,  (knowledge  (sparse         (SQLite: status,
+                  metrics,  graph)     retrieval)       attempts, checksum)
                   cache)
 ```
+
+Ingestion is synchronous by default (`ASYNC_INGESTION=false`) — the pipeline
+above activates when you turn it on. See [Async Ingestion](#async-ingestion).
 
 ---
 
@@ -236,8 +266,17 @@ enterprise-rag-assistant/
 │   │   ├── tool_node.py       # Tool routing (MCP + regex fallback)
 │   │   └── tracing.py         # Per-node performance tracing
 │   ├── ingestion/
-│   │   ├── loader.py          # PDF/TXT/MD file loaders with metadata
-│   │   └── chunker.py         # Recursive + markdown-aware splitting
+│   │   ├── loader.py          # PDF/DOCX/CSV/TXT/MD loaders with metadata
+│   │   ├── chunker.py         # Recursive + markdown-aware splitting
+│   │   ├── registry.py        # Document lifecycle + idempotency (SQLite)
+│   │   ├── pipeline.py        # download -> parse -> chunk -> embed -> store
+│   │   └── worker.py          # Queue consumer: retry x3, DLQ, crash recovery
+│   ├── storage/
+│   │   └── object_store.py    # Durable blob storage (local filesystem / S3)
+│   ├── events/
+│   │   ├── bus.py             # Event envelope + bus protocol + factory
+│   │   ├── sqlite_bus.py      # Durable queue with visibility timeouts
+│   │   └── kafka_bus.py       # Kafka producer/consumer, manual offset commit
 │   ├── knowledge_graph/
 │   │   ├── models.py          # Entity, Relationship, Triple models
 │   │   ├── extractor.py       # LLM entity-relationship extraction
@@ -251,7 +290,8 @@ enterprise-rag-assistant/
 │   │   └── context_builder.py     # Token-budgeted history formatting
 │   ├── observability/
 │   │   ├── cost_callback.py   # Per-query cost/token tracking
-│   │   ├── health_checker.py  # Subsystem health checks
+│   │   ├── health_checker.py  # Subsystem health checks (incl. queue/DLQ depth)
+│   │   ├── request_context.py # X-Request-ID propagation across processes
 │   │   └── metrics_store.py   # SQLite metrics persistence
 │   ├── rag/
 │   │   └── naive_rag.py       # Baseline LCEL chain (no graph)
@@ -284,17 +324,19 @@ enterprise-rag-assistant/
 ├── scripts/
 │   ├── ask.py                 # CLI query tool (--mode graph/naive/auto)
 │   ├── ingest.py              # Batch document ingestion
+│   ├── worker.py              # Ingestion worker entrypoint (graceful shutdown)
 │   ├── cleanup_stale.py       # Document TTL cleanup
 │   ├── metrics.py             # Metrics dashboard CLI
 │   └── upload_eval_dataset.py # Evaluation dataset uploader
 │
-├── tests/                     # 700+ tests across 36 files
+├── tests/                     # 860+ tests across 42 files
 │   ├── conftest.py            # Shared fixtures
 │   └── test_*.py              # Unit, integration, and e2e tests
 │
 ├── data/sample_docs/          # Sample enterprise documents (6 departments)
 ├── Dockerfile                 # Python 3.11-slim container
-├── docker-compose.yml         # API + UI multi-service deployment
+├── docker-compose.yml         # Dev: API + UI (+ worker via --profile async)
+├── docker-compose.prod.yml    # Prod: API + workers + Kafka + MinIO + UI
 ├── requirements.txt           # Python dependencies
 ├── .env.example               # Configuration template
 ├── .gitignore                 # Secrets, caches, build artifacts excluded
@@ -310,6 +352,7 @@ enterprise-rag-assistant/
 - **OpenAI API key** (for `gpt-4o-mini` and `text-embedding-3-small`)
 - **Tavily API key** (optional, for web search fallback)
 - **Docker & Docker Compose** (optional, for containerized deployment)
+- **Kafka + S3/MinIO** (optional — only for `EVENT_BUS=kafka` / `STORAGE_BACKEND=s3`; the async ingestion defaults run entirely on local files, no broker needed)
 
 ---
 
@@ -459,6 +502,31 @@ All settings are managed via environment variables (loaded from `.env`). The sys
 | `CORS_ORIGINS` | `http://localhost:8501` | Allowed CORS origins |
 | `MAX_UPLOAD_SIZE_MB` | `10` | Maximum file upload size |
 
+### Async Ingestion
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ASYNC_INGESTION` | `false` | Store + queue uploads and return `202` instead of indexing inline |
+| `STORAGE_BACKEND` | `local` | Object storage: `local` or `s3` |
+| `STORAGE_LOCAL_DIR` | `./object_store` | Where uploaded bytes are kept when `local` |
+| `S3_BUCKET` | `""` | Bucket name (required when `s3`) |
+| `S3_REGION` | `us-east-1` | AWS region |
+| `S3_ENDPOINT_URL` | `""` | Point at MinIO or another S3-compatible store; blank = AWS |
+| `S3_PREFIX` | `documents` | Key prefix for stored documents |
+| `EVENT_BUS` | `sqlite` | Event transport: `sqlite` or `kafka` |
+| `EVENT_BUS_PATH` | `./checkpoints/event_bus.db` | Queue file when `sqlite` (workers must share it) |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka brokers |
+| `KAFKA_TOPIC_INGESTION` | `document.uploaded` | Upload event topic |
+| `KAFKA_TOPIC_DLQ` | `document.uploaded.dlq` | Dead-letter topic |
+| `KAFKA_CONSUMER_GROUP` | `ingestion-workers` | Consumer group for workers |
+| `INGEST_MAX_ATTEMPTS` | `3` | Attempts before an event is dead-lettered |
+| `INGEST_RETRY_BACKOFF_S` | `2.0` | Base delay for exponential retry backoff |
+| `INGEST_VISIBILITY_TIMEOUT_S` | `300` | Redelivery window if a worker dies mid-document |
+| `WORKER_POLL_INTERVAL_S` | `1.0` | Idle poll interval |
+| `WORKER_BATCH_SIZE` | `1` | Events claimed per poll |
+| `DOCUMENT_REGISTRY_PATH` | `./checkpoints/documents.db` | Document lifecycle store |
+| `JSON_LOGS` | `false` | Structured JSON logs with request IDs |
+
 ---
 
 ## Running the Application
@@ -481,7 +549,24 @@ Then open **http://localhost:8501** in your browser.
 uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Option 3: CLI
+### Option 3: With the async ingestion worker
+
+Uploads return `202` immediately and a worker indexes them in the background.
+No broker required — the defaults use a local object store and a durable
+SQLite queue:
+
+```bash
+# Terminal 1 - API Server
+ASYNC_INGESTION=true uvicorn api.app:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 - Ingestion worker (run more copies to index faster)
+ASYNC_INGESTION=true python -m scripts.worker
+
+# Terminal 3 - Streamlit UI
+streamlit run ui/app.py --server.port 8501
+```
+
+### Option 4: CLI
 
 ```bash
 # Naive mode (fast, no graph)
@@ -501,11 +586,14 @@ python -m scripts.ask --mode graph --filter department=hr "What is the dress cod
 
 ## Docker Deployment
 
-### Using Docker Compose (recommended)
+### Development (recommended for local work)
 
 ```bash
-# Build and start both services
+# Build and start API + UI
 docker-compose up --build -d
+
+# Add the ingestion worker (requires ASYNC_INGESTION=true in .env)
+docker-compose --profile async up -d
 
 # View logs
 docker-compose logs -f
@@ -517,6 +605,27 @@ docker-compose down
 Services:
 - **API**: http://localhost:8000
 - **UI**: http://localhost:8501
+
+### Production (Kafka + MinIO + scalable workers)
+
+`docker-compose.prod.yml` brings up the full event-driven topology already
+configured — Kafka in KRaft mode (no ZooKeeper), MinIO with its bucket
+created on startup, the API, a worker, and the UI:
+
+```bash
+docker-compose -f docker-compose.prod.yml up --build -d
+
+# Scale ingestion independently of query traffic
+docker-compose -f docker-compose.prod.yml up -d --scale worker=3
+
+# Follow worker logs
+docker-compose -f docker-compose.prod.yml logs -f worker
+```
+
+Workers get `stop_grace_period: 60s`, so `docker stop` lets the in-flight
+document finish rather than tearing an index write in half.
+
+Requires the optional extras in `requirements.txt`: `boto3`, `kafka-python`.
 
 ### Using Dockerfile (API only)
 
@@ -535,8 +644,12 @@ The following directories should be mounted as volumes for data persistence:
 | Volume | Purpose |
 |--------|---------|
 | `./chroma_db` | Vector store data |
-| `./checkpoints` | Conversation history, metrics, knowledge graph |
+| `./checkpoints` | Conversation history, metrics, knowledge graph, document registry, SQLite queue |
+| `./object_store` | Uploaded document bytes (`STORAGE_BACKEND=local`) |
 | `./data` | Source documents (read-only) |
+
+In production the last two are replaced by MinIO/S3 and Kafka, which manage
+their own volumes (`minio_data`, `kafka_data`).
 
 ---
 
@@ -890,7 +1003,7 @@ requeues it.
 
 ## Testing
 
-The project has **860+ tests** across 41 test files covering unit, integration, and end-to-end scenarios.
+The project has **868 tests** across 42 test files covering unit, integration, and end-to-end scenarios.
 
 ```bash
 # Run all tests
@@ -926,7 +1039,16 @@ pytest tests/test_e2e_smoke.py -v
 | MCP integration | 17+ | `test_phase18_mcp.py` |
 | Resilience | 64+ | `test_phase8_resilience.py`, `test_phase9_circuit_breaker.py` |
 | Parallel processing | 20+ | `test_phase20_parallel.py` |
+| Object storage | 21+ | `test_phase22_storage.py` |
+| Event bus & queue semantics | 26+ | `test_phase22_events.py` |
+| Document registry & idempotency | 37+ | `test_phase22_registry.py` |
+| Ingestion worker (retry/DLQ) | 24+ | `test_phase22_worker.py` |
+| Async upload API | 39+ | `test_phase22_upload_async.py` |
 | Integration & E2E | 46+ | `test_integration.py`, `test_e2e_smoke.py` |
+
+The ingestion suites run against the real SQLite queue, a real registry and a
+temp-directory object store, so retry, dead-lettering, visibility timeouts and
+concurrent-claim races are exercised for real rather than mocked.
 
 ---
 
@@ -985,6 +1107,9 @@ All LLM responses pass through PII redaction before reaching the client. Detecte
 - File uploads are validated for type, size, and filename
 - Rate limiting prevents abuse (configurable per-minute threshold)
 - CORS is locked to specific origins (default: `localhost:8501`)
+- Object storage keys are validated against path traversal -- a crafted filename cannot write outside the storage root
+- Documents are scoped to the API key that uploaded them; `/documents` returns 404 (not 403) for another tenant's ID, so it cannot be used to probe for existence
+- `./object_store` is gitignored -- uploaded user documents never enter version control
 
 ---
 
@@ -1013,6 +1138,41 @@ curl http://localhost:8000/health
 
 # Deep health check (verifies all subsystems)
 curl http://localhost:8000/health?deep=true
+```
+
+With async ingestion enabled, the deep check also reports object-store
+reachability, queue backlog and **DLQ depth**. A non-zero dead-letter count
+means documents were accepted from users and never indexed — a failure that
+is otherwise invisible from the query side.
+
+### Ingestion Monitoring
+
+```bash
+# Status of one upload
+curl http://localhost:8000/documents/doc_7c7cf309aca80ed93c7e46bc10fd2ac5
+
+# Backlog and per-status counts
+curl http://localhost:8000/documents
+
+# Just the ones that gave up
+curl "http://localhost:8000/documents?status=DEAD_LETTER"
+```
+
+Re-uploading a dead-lettered file resets its retry budget and requeues it.
+
+### Request Tracing
+
+Every response carries an `X-Request-ID` (echoed from the request when you
+supply one). With `JSON_LOGS=true`, that ID appears on every log line and is
+carried through the queue into the worker, so a single upload can be followed
+across processes:
+
+```bash
+curl -X POST http://localhost:8000/upload \
+  -H "X-Request-ID: trace-abc-123" \
+  -F "file=@handbook.pdf" -F "department=hr"
+
+docker-compose logs api worker | grep trace-abc-123
 ```
 
 ### LangSmith Tracing
