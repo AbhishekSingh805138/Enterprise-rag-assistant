@@ -88,9 +88,25 @@ class TestLoadPath:
             load_path(str(tmp_path))
 
     def test_unsupported_files_skipped(self, tmp_path):
-        (tmp_path / "data.csv").write_text("a,b,c\n1,2,3\n")
+        # .xlsx/.jpg are outside SUPPORTED_SUFFIXES, so nothing loads.
+        (tmp_path / "sheet.xlsx").write_bytes(b"PK\x03\x04fake")
+        (tmp_path / "photo.jpg").write_bytes(b"\xff\xd8\xff fake")
         with pytest.raises(FileNotFoundError):
             load_path(str(tmp_path))
+
+    def test_csv_is_supported(self, tmp_path):
+        """CSV is one of the ingestion architecture's accepted types."""
+        (tmp_path / "data.csv").write_text("name,role\nada,engineer\n", encoding="utf-8")
+        docs = load_path(str(tmp_path))
+        assert len(docs) == 1
+        assert docs[0].metadata["doc_type"] == "csv"
+        assert "ada" in docs[0].page_content
+
+    def test_unsupported_files_are_ignored_alongside_supported_ones(self, tmp_path):
+        (tmp_path / "notes.md").write_text("# Notes\nHello.\n", encoding="utf-8")
+        (tmp_path / "photo.jpg").write_bytes(b"\xff\xd8\xff fake")
+        docs = load_path(str(tmp_path))
+        assert [d.metadata["filename"] for d in docs] == ["notes.md"]
 
     def test_doc_type_correct(self, sample_docs_path):
         docs = load_path(sample_docs_path)

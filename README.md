@@ -80,11 +80,18 @@ A production-grade **Retrieval-Augmented Generation (RAG)** system built for ent
 | Streamlit UI     |     | FastAPI API Layer          |     | OpenAI API     |
 | - Chat interface |---->| - POST /ask (SSE stream)   |---->| gpt-4o-mini    |
 | - File upload    |     | - POST /ingest             |     | text-embedding |
-| - Session mgmt   |     | - POST /upload             |     | -3-small       |
-+------------------+     | - POST /eval               |     +----------------+
-                          | - GET  /health             |     | Tavily API     |
-                          | - GET  /tools              |     | (web fallback) |
-                          +---------------------------+     +----------------+
+| - Session mgmt   |     | - POST /upload  (202)      |     | -3-small       |
++------------------+     | - GET  /documents/{id}     |     +----------------+
+                          | - POST /eval               |     | Tavily API     |
+                          | - GET  /health             |     | (web fallback) |
+                          | - GET  /tools              |     +----------------+
+                          +---------------------------+
+                                     |
+                     Async ingestion (ASYNC_INGESTION=true)
+                                     |
+                    object store  ->  queue  ->  worker  ->  vector DB
+                    (S3/local)       (Kafka/    (retry x3
+                                      SQLite)    -> DLQ)
                                      |
                     +----------------+------------------+
                     |                                   |
@@ -657,14 +664,16 @@ Content-Type: application/json
 ### Upload Document
 
 ```
-POST /upload?department=hr
+POST /upload
 Authorization: Bearer <api-key>
 Content-Type: multipart/form-data
 ```
 
-Upload a PDF, TXT, or MD file (max 10 MB). The `department` query parameter tags the document for metadata filtering.
+Upload a PDF, DOCX, CSV, TXT or MD file (max 10 MB). `department` tags the
+document for metadata filtering and access level, and is accepted as either
+a form field or a query parameter.
 
-**Response** (200):
+**Response** (200) — default, synchronous indexing:
 ```json
 {
   "filename": "travel_policy.pdf",
@@ -672,6 +681,50 @@ Upload a PDF, TXT, or MD file (max 10 MB). The `department` query parameter tags
   "chunks_created": 3,
   "chunks_added": 3,
   "collection_total": 18
+}
+```
+
+**Response** (202) — with `ASYNC_INGESTION=true`, the file is stored and
+queued and a worker indexes it (see [Async Ingestion](#async-ingestion)):
+```json
+{
+  "document_id": "doc_7c7cf309aca80ed93c7e46bc10fd2ac5",
+  "filename": "travel_policy.pdf",
+  "department": "hr",
+  "status": "PENDING",
+  "duplicate": false,
+  "checksum": "e3b0c442...",
+  "size_bytes": 20480,
+  "status_url": "/documents/doc_7c7cf309aca80ed93c7e46bc10fd2ac5"
+}
+```
+
+Re-uploading identical content returns **200** with `duplicate: true` and the
+original `document_id` — no parsing or embedding is repeated.
+
+---
+
+### Document Status
+
+```
+GET /documents/{document_id}
+GET /documents?status=PROCESSED&department=hr&limit=50
+Authorization: Bearer <api-key>
+```
+
+Lifecycle state of uploaded documents. Status is one of `PENDING`,
+`PROCESSING`, `PROCESSED`, `FAILED`, `DEAD_LETTER`.
+
+**Response** (200):
+```json
+{
+  "document_id": "doc_7c7cf309aca80ed93c7e46bc10fd2ac5",
+  "filename": "travel_policy.pdf",
+  "department": "hr",
+  "status": "PROCESSED",
+  "attempts": 1,
+  "chunks_indexed": 3,
+  "size_bytes": 20480
 }
 ```
 
@@ -751,12 +804,93 @@ Content-Type: application/json
 | `python -m scripts.metrics --last 50` | Show last 50 queries |
 | `python -m scripts.cleanup_stale` | Remove documents past TTL |
 | `python -m scripts.upload_eval_dataset` | Upload evaluation dataset |
+| `python -m scripts.worker` | Run the ingestion worker (async pipeline) |
+| `python -m scripts.worker --once` | Drain the queue and exit (CI/backfill) |
+
+---
+
+## Async Ingestion
+
+By default `/upload` parses and embeds inline and returns `200`. That keeps
+the request path simple, but it holds the connection for the whole embedding
+run, keeps no durable copy of the file, and loses the upload entirely if the
+embedding API returns a 429.
+
+Set `ASYNC_INGESTION=true` to switch to the event-driven pipeline:
+
+```
+upload ─► validate ─► idempotency check ─► object store ─► queue ─► 202
+                                                             │
+                                                             ▼
+                                            worker ─► parse ─► chunk
+                                                   ─► embed ─► vector DB
+                                                   ─► mark PROCESSED
+                                                        │
+                                          failure ─► retry ×3 ─► DLQ
+```
+
+### Running it locally (no broker required)
+
+The defaults are `STORAGE_BACKEND=local` and `EVENT_BUS=sqlite`, a durable
+on-disk queue with visibility timeouts — so retries and dead-lettering behave
+exactly as they do on Kafka, with nothing to install:
+
+```bash
+# terminal 1
+ASYNC_INGESTION=true uvicorn api.app:app --reload
+
+# terminal 2
+ASYNC_INGESTION=true python -m scripts.worker
+```
+
+```bash
+curl -X POST http://localhost:8000/upload \
+  -F "file=@handbook.pdf" -F "department=hr"
+# {"document_id":"doc_7c7c...","status":"PENDING", ...}   202
+
+curl http://localhost:8000/documents/doc_7c7c...
+# {"status":"PROCESSED","chunks_indexed":12, ...}
+```
+
+### Running it on Kafka + S3
+
+`docker-compose.prod.yml` brings up Kafka (KRaft, no ZooKeeper), MinIO, the
+API and a worker, already configured:
+
+```bash
+docker-compose -f docker-compose.prod.yml up -d
+docker-compose -f docker-compose.prod.yml up -d --scale worker=3
+```
+
+Requires the optional extras: `pip install boto3 kafka-python`.
+
+### Operating it
+
+| Concern | Where to look |
+|---------|---------------|
+| Did my upload index? | `GET /documents/{id}` |
+| Backlog / stuck documents | `GET /documents` (per-status counts) |
+| Queue and DLQ depth | `GET /health?deep=true` |
+| Tracing one upload across processes | `JSON_LOGS=true` + the `X-Request-ID` header |
+
+A non-zero `DEAD_LETTER` count means documents were accepted from users and
+never indexed. Re-uploading the same file resets its retry budget and
+requeues it.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `ASYNC_INGESTION` | `false` | Enable the async pipeline |
+| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `EVENT_BUS` | `sqlite` | `sqlite` or `kafka` |
+| `INGEST_MAX_ATTEMPTS` | `3` | Attempts before dead-lettering |
+| `INGEST_VISIBILITY_TIMEOUT_S` | `300` | Redelivery window if a worker dies |
+| `JSON_LOGS` | `false` | Structured logs with request ids |
 
 ---
 
 ## Testing
 
-The project has **700+ tests** across 36 test files covering unit, integration, and end-to-end scenarios.
+The project has **860+ tests** across 41 test files covering unit, integration, and end-to-end scenarios.
 
 ```bash
 # Run all tests

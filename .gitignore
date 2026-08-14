@@ -29,6 +29,8 @@ chroma_db/
 checkpoints/
 .ragas_cache/
 chroma_store_data/
+# Uploaded document bytes (STORAGE_BACKEND=local) — user data, never commit
+object_store/
 
 # Testing
 .pytest_cache/

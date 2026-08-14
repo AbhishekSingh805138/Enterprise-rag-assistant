@@ -24,7 +24,14 @@ networkx>=3.0              # knowledge graph (Phase 16)
 
 # Document loaders
 pypdf>=5.0               # PDF loading
+docx2txt>=0.8            # .docx loading (Phase 22)
 unstructured>=0.16       # richer doc parsing (optional)
+
+# Async ingestion pipeline (Phase 22)
+# Both are optional: the defaults (STORAGE_BACKEND=local, EVENT_BUS=sqlite)
+# need neither. Install for STORAGE_BACKEND=s3 / EVENT_BUS=kafka.
+boto3>=1.35              # S3 / MinIO object storage
+kafka-python>=2.0        # Kafka event bus
 
 # Evaluation (Phase 2)
 ragas>=0.2,<0.3               # pin to 0.2.x; 0.4+ has broken langchain imports

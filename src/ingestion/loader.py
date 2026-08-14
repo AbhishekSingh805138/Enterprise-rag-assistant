@@ -1,8 +1,11 @@
 """Load raw documents from a directory into LangChain Document objects.
 
-Supports .pdf, .txt, and .md out of the box. Each loaded Document carries
+Supports .pdf, .docx, .csv, .txt and .md. Each loaded Document carries
 metadata (source path, file type, department, access_level) so the vector
 store can do metadata-filtered retrieval later.
+
+.docx needs the optional ``docx2txt`` package; the failure is reported per
+file and skipped rather than aborting a whole directory ingest.
 """
 from __future__ import annotations
 
@@ -15,7 +18,32 @@ from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md"}
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".csv", ".txt", ".md"}
+
+
+def _load_docx(path: Path) -> list[Document]:
+    """Load a .docx via docx2txt, with an actionable error when it is absent."""
+    try:
+        import docx2txt  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "Loading .docx files requires docx2txt. Install it with: pip install docx2txt"
+        ) from e
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    return Docx2txtLoader(str(path)).load()
+
+
+def _load_csv(path: Path) -> list[Document]:
+    """Load a .csv as one Document per row (LangChain's CSVLoader default).
+
+    Row-level granularity keeps each embedded unit semantically whole; the
+    chunker leaves them alone since rows are almost always under the chunk
+    size.
+    """
+    from langchain_community.document_loaders import CSVLoader
+
+    return CSVLoader(str(path), encoding="utf-8").load()
 
 # Documents in these folders are marked confidential; everything else is internal.
 _CONFIDENTIAL_DEPARTMENTS = {"legal", "security"}
@@ -67,6 +95,10 @@ def load_path(path: str | Path) -> list[Document]:
         try:
             if suffix == ".pdf":
                 loaded = PyPDFLoader(str(f)).load()
+            elif suffix == ".docx":
+                loaded = _load_docx(f)
+            elif suffix == ".csv":
+                loaded = _load_csv(f)
             elif suffix in {".txt", ".md"}:
                 loaded = TextLoader(str(f), encoding="utf-8").load()
             else:

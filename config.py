@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -136,6 +137,53 @@ class Settings:
     memory_max_turns: int = int(os.getenv("MEMORY_MAX_TURNS", "10"))
     memory_max_tokens: int = int(os.getenv("MEMORY_MAX_TOKENS", "2000"))
 
+    # -----------------------------------------------------------------
+    # Phase 22: Event-driven ingestion (upload -> object store -> queue
+    # -> worker). See ARCHITECTURE.md §1.2.
+    # -----------------------------------------------------------------
+    # When false (default), POST /upload keeps the legacy synchronous
+    # behaviour: parse + embed inline, respond 200 with chunk counts.
+    # When true, /upload durably stores the file, publishes an event and
+    # responds 202 — a separate worker process does the indexing.
+    async_ingestion: bool = os.getenv("ASYNC_INGESTION", "false").lower() == "true"
+
+    # Object storage: "local" (filesystem, no extra deps) or "s3" (boto3;
+    # also speaks to MinIO/any S3-compatible store via S3_ENDPOINT_URL).
+    storage_backend: str = os.getenv("STORAGE_BACKEND", "local")
+    storage_local_dir: str = os.getenv("STORAGE_LOCAL_DIR", str(PROJECT_ROOT / "object_store"))
+    s3_bucket: str = os.getenv("S3_BUCKET", "")
+    s3_region: str = os.getenv("S3_REGION", "us-east-1")
+    s3_endpoint_url: str = os.getenv("S3_ENDPOINT_URL", "")
+    s3_prefix: str = os.getenv("S3_PREFIX", "documents")
+
+    # Event bus: "sqlite" (durable local queue with visibility timeout —
+    # works with no broker running) or "kafka".
+    event_bus: str = os.getenv("EVENT_BUS", "sqlite")
+    event_bus_path: str = os.getenv(
+        "EVENT_BUS_PATH", str(PROJECT_ROOT / "checkpoints" / "event_bus.db")
+    )
+    kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    kafka_topic_ingestion: str = os.getenv("KAFKA_TOPIC_INGESTION", "document.uploaded")
+    kafka_topic_dlq: str = os.getenv("KAFKA_TOPIC_DLQ", "document.uploaded.dlq")
+    kafka_consumer_group: str = os.getenv("KAFKA_CONSUMER_GROUP", "ingestion-workers")
+
+    # Worker retry policy. The diagram calls for up to 3 attempts before
+    # the event is routed to the dead-letter queue.
+    ingest_max_attempts: int = int(os.getenv("INGEST_MAX_ATTEMPTS", "3"))
+    ingest_retry_backoff_s: float = float(os.getenv("INGEST_RETRY_BACKOFF_S", "2.0"))
+    # How long a claimed event stays invisible to other workers before it
+    # is considered abandoned and redelivered (worker crash recovery).
+    ingest_visibility_timeout_s: int = int(os.getenv("INGEST_VISIBILITY_TIMEOUT_S", "300"))
+    worker_poll_interval_s: float = float(os.getenv("WORKER_POLL_INTERVAL_S", "1.0"))
+    worker_batch_size: int = int(os.getenv("WORKER_BATCH_SIZE", "1"))
+    document_registry_path: str = os.getenv(
+        "DOCUMENT_REGISTRY_PATH", str(PROJECT_ROOT / "checkpoints" / "documents.db")
+    )
+
+    # Emit one JSON object per log line (for log aggregators). Includes the
+    # request/trace id so an upload can be followed API -> queue -> worker.
+    json_logs: bool = os.getenv("JSON_LOGS", "false").lower() == "true"
+
     # Phase 8: Infrastructure
     chroma_refresh_interval: int = int(os.getenv("CHROMA_REFRESH_INTERVAL", "300"))
     document_ttl_days: int = int(os.getenv("DOCUMENT_TTL_DAYS", "0"))
@@ -177,6 +225,30 @@ class Settings:
             raise ValueError(
                 f"Invalid CRITIC_MODE {self.critic_mode!r}. Choose from: always, adaptive, off"
             )
+        if self.storage_backend.lower() not in {"local", "s3"}:
+            raise ValueError(
+                f"Invalid STORAGE_BACKEND {self.storage_backend!r}. Choose from: local, s3"
+            )
+        if self.event_bus.lower() not in {"sqlite", "kafka"}:
+            raise ValueError(
+                f"Invalid EVENT_BUS {self.event_bus!r}. Choose from: sqlite, kafka"
+            )
+        if self.storage_backend.lower() == "s3" and not self.s3_bucket:
+            raise ValueError("STORAGE_BACKEND=s3 requires S3_BUCKET to be set.")
+        if self.ingest_max_attempts < 1:
+            raise ValueError(
+                f"ingest_max_attempts must be at least 1, got {self.ingest_max_attempts}"
+            )
+        if self.ingest_visibility_timeout_s <= 0:
+            raise ValueError(
+                f"ingest_visibility_timeout_s must be positive, got {self.ingest_visibility_timeout_s}"
+            )
+        if self.async_ingestion and self.event_bus.lower() == "sqlite":
+            logging.getLogger(__name__).info(
+                "ASYNC_INGESTION is on with the SQLite event bus — durable and "
+                "correct for a single node, but workers must share the same "
+                "EVENT_BUS_PATH. Use EVENT_BUS=kafka to scale out."
+            )
         if self.langsmith_tracing.lower() == "true" and not self.langsmith_api_key:
             logging.getLogger(__name__).warning(
                 "LANGSMITH_TRACING is enabled but LANGSMITH_API_KEY is not set — "
@@ -187,16 +259,49 @@ class Settings:
 settings = Settings()
 
 
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line, with the ambient request id attached.
+
+    Log aggregators (CloudWatch, Loki, Datadog) index structured fields;
+    the plain-text formatter forces them to regex the message instead.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+
+        from src.observability.request_context import get_request_id
+
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        request_id = get_request_id()
+        if request_id:
+            payload["request_id"] = request_id
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        # Anything attached via logger.info(..., extra={...}).
+        for key, value in getattr(record, "__dict__", {}).items():
+            if key.startswith("ctx_"):
+                payload[key[4:]] = value
+        return json.dumps(payload, default=str)
+
+
 def setup_logging() -> None:
     """Configure logging for the entire application. Call once at entry point."""
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+    if settings.json_logs:
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
         )
-    )
     root = logging.getLogger()
     root.setLevel(level)
     # Avoid adding duplicate handlers on repeated calls.

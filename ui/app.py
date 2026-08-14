@@ -303,8 +303,8 @@ with st.sidebar:
     st.markdown("**Upload Documents**")
     uploaded_file = st.file_uploader(
         "Upload a document",
-        type=["pdf", "txt", "md"],
-        help="Supported: PDF, TXT, Markdown",
+        type=["pdf", "docx", "csv", "txt", "md"],
+        help="Supported: PDF, DOCX, CSV, TXT, Markdown",
         label_visibility="collapsed",
     )
     department = st.selectbox(
@@ -325,11 +325,28 @@ with st.sidebar:
                 )
                 if resp.ok:
                     result = resp.json()
-                    st.success(
-                        f"**{result['filename']}** ingested  \n"
-                        f"{result['chunks_added']} new chunks "
-                        f"({result['collection_total']} total)"
-                    )
+                    if "document_id" in result:
+                        # Async pipeline: the file is stored and queued; a
+                        # worker indexes it. Show the id so the user can
+                        # correlate it with the status endpoint.
+                        if result.get("duplicate"):
+                            st.info(
+                                f"**{result['filename']}** was already uploaded  \n"
+                                f"Status: `{result['status']}` "
+                                f"(`{result['document_id']}`)"
+                            )
+                        else:
+                            st.success(
+                                f"**{result['filename']}** accepted for indexing  \n"
+                                f"Document `{result['document_id']}` — "
+                                f"track progress at `/documents/{result['document_id']}`"
+                            )
+                    else:
+                        st.success(
+                            f"**{result['filename']}** ingested  \n"
+                            f"{result['chunks_added']} new chunks "
+                            f"({result['collection_total']} total)"
+                        )
                 else:
                     st.error(f"Upload failed: {resp.json().get('detail', resp.text)}")
             except requests.ConnectionError:

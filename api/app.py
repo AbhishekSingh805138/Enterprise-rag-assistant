@@ -1,10 +1,14 @@
 """FastAPI application for the Enterprise RAG Assistant.
 
 Endpoints:
-    GET  /health  — Liveness check with collection stats
-    POST /ask     — Query the RAG pipeline (supports streaming via SSE)
-    POST /ingest  — Trigger document ingestion
-    POST /eval    — Run RAGAS evaluation suite
+    GET  /health              — Liveness check with collection stats
+    POST /ask                 — Query the RAG pipeline (supports streaming via SSE)
+    POST /ingest              — Trigger server-side document ingestion
+    POST /upload              — Upload a document (202 + async indexing when enabled)
+    GET  /documents           — List documents and their ingestion status
+    GET  /documents/{id}      — Status of one uploaded document
+    POST /eval                — Run RAGAS evaluation suite
+    GET  /tools               — List MCP tool registry
 """
 from __future__ import annotations
 
@@ -18,7 +22,16 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from slowapi import Limiter
@@ -27,6 +40,12 @@ from slowapi.util import get_remote_address
 from starlette.responses import JSONResponse
 
 from config import settings, setup_logging
+from src.observability.request_context import (
+    get_request_id,
+    new_request_id,
+    reset_request_id,
+    set_request_id,
+)
 from src.security.auth import verify_api_key
 from src.security.guardrails import check_guardrails
 from src.security.output_filter import filter_output
@@ -34,12 +53,15 @@ from src.security.output_filter import filter_output
 from api.models import (
     AskRequest,
     AskResponse,
+    DocumentListResponse,
+    DocumentStatusResponse,
     ErrorResponse,
     EvalRequest,
     EvalResponse,
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    UploadAcceptedResponse,
     UploadResponse,
 )
 
@@ -178,6 +200,27 @@ app.add_middleware(
     allow_methods=_cors_methods,
     allow_headers=_cors_headers,
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Bind a request id for the lifetime of the request and echo it back.
+
+    Honours a caller-supplied X-Request-ID so a trace started upstream (a
+    gateway, the UI) stays intact. The id is stamped onto every log line
+    and onto published ingestion events, which is what lets a single
+    upload be followed across the API, the queue and the worker.
+    """
+    incoming = request.headers.get("X-Request-ID", "").strip()
+    request_id = incoming[:64] if incoming else new_request_id()
+    token = set_request_id(request_id)
+    request.state.request_id = request_id
+    try:
+        response = await call_next(request)
+    finally:
+        reset_request_id(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -577,9 +620,13 @@ async def ingest_endpoint(request: Request, body: IngestRequest):
 # POST /upload
 # ---------------------------------------------------------------------------
 
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".csv", ".txt", ".md"}
 ALLOWED_MIME_TYPES = {
     "application/pdf", "text/plain", "text/markdown", "text/x-markdown",
+    "text/csv", "application/csv",
+    "application/vnd.ms-excel",  # what several browsers send for .csv
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
     "application/octet-stream",  # browsers often send this for .md files
 }
 
@@ -593,12 +640,218 @@ def _sanitize_filename(name: str) -> str:
     return base
 
 
-@app.post("/upload", response_model=UploadResponse, responses={400: {"model": ErrorResponse}},
-           dependencies=[Depends(verify_api_key)])
+def _upload_sync(content: bytes, safe_name: str, department: str) -> UploadResponse:
+    """Parse, chunk and index the upload inline (ASYNC_INGESTION=false).
+
+    Runs on a worker thread: every call below is blocking I/O, and holding
+    the event loop for the length of an embedding run would stall every
+    concurrent request on the process.
+    """
+    from src.ingestion.chunker import chunk_documents
+    from src.ingestion.loader import load_path
+    from src.vectorstore.chroma_store import add_chunks, collection_stats
+
+    # Save uploaded file to a temp directory so the loader can read it
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dept_dir = Path(tmpdir) / department
+        dept_dir.mkdir()
+        dest = dept_dir / safe_name
+        dest.write_bytes(content)
+        logger.info(
+            "Upload: saved %s (%d bytes) to temp dir, department=%s",
+            safe_name, len(content), department,
+        )
+
+        docs = load_path(tmpdir)
+
+        # Rewrite source metadata: replace temp path with a stable
+        # identifier so citations are meaningful and content-hash
+        # deduplication works across re-uploads of the same file.
+        from src.ingestion.pipeline import stable_source
+
+        source = stable_source(department, safe_name)
+        for doc in docs:
+            doc.metadata["source"] = source
+
+        chunks = chunk_documents(docs)
+        added = add_chunks(chunks)
+        stats = collection_stats()
+
+    logger.info(
+        "Upload complete: %s -> %d docs, %d chunks, %d new (total %d)",
+        safe_name, len(docs), len(chunks), added, stats["document_count"],
+    )
+    return UploadResponse(
+        filename=safe_name,
+        documents_loaded=len(docs),
+        chunks_created=len(chunks),
+        chunks_added=added,
+        collection_total=stats["document_count"],
+    )
+
+
+def _upload_async(
+    content: bytes,
+    safe_name: str,
+    department: str,
+    content_type: str,
+    uploaded_by: str,
+    request_id: str,
+) -> tuple[UploadAcceptedResponse, int]:
+    """Store durably, queue for indexing, and return (response, status_code).
+
+    This is the top lane of the ingestion architecture: idempotency check,
+    generate document id if new, persist the bytes, publish the event,
+    respond 202. No parsing or embedding happens on the request path.
+    """
+    from src.events.bus import DOCUMENT_UPLOADED, Event, get_event_bus
+    from src.ingestion.registry import (
+        STATUS_DEAD_LETTER,
+        STATUS_FAILED,
+        STATUS_PENDING,
+        compute_checksum,
+        get_registry,
+    )
+    from src.storage.object_store import build_storage_key, get_object_store
+
+    checksum = compute_checksum(content)
+    registry = get_registry()
+
+    # --- Idempotency check / Generate Document ID (if new) ---
+    record, created = registry.register_upload(
+        checksum=checksum,
+        filename=safe_name,
+        department=department,
+        content_type=content_type,
+        size_bytes=len(content),
+        uploaded_by=uploaded_by,
+        request_id=request_id,
+    )
+
+    should_queue = created
+    if not created:
+        if record.status in (STATUS_FAILED, STATUS_DEAD_LETTER):
+            # Re-uploading a document whose indexing gave up is an explicit
+            # request to try again — reset the retry budget and requeue.
+            should_queue = registry.reset_for_retry(record.document_id)
+        elif record.status == STATUS_PENDING and not record.storage_key:
+            # Registered but never stored: the previous attempt died between
+            # the INSERT and the upload. Heal it instead of stranding it.
+            logger.warning(
+                "Document %s was registered without stored bytes — requeueing",
+                record.document_id,
+            )
+            should_queue = True
+
+    if not should_queue:
+        # --- "Document Already Exists?" -> Yes -> Return Existing Document ID ---
+        logger.info(
+            "Duplicate upload of %s (%s) — returning existing document %s (status=%s)",
+            safe_name, department, record.document_id, record.status,
+        )
+        return (
+            UploadAcceptedResponse(
+                document_id=record.document_id,
+                filename=record.filename,
+                department=record.department,
+                status=record.status,
+                duplicate=True,
+                checksum=record.checksum,
+                size_bytes=record.size_bytes,
+                storage_uri=record.storage_uri,
+                status_url=f"/documents/{record.document_id}",
+                message="This document was already accepted; no new work was queued.",
+            ),
+            200,
+        )
+
+    document_id = record.document_id
+    try:
+        # --- Upload File to S3 ---
+        store = get_object_store()
+        storage_key = build_storage_key(department, document_id, safe_name)
+        storage_uri = store.put(storage_key, content, content_type)
+        registry.attach_storage(document_id, storage_key, storage_uri)
+
+        # --- Publish Kafka Event ---
+        get_event_bus().publish(
+            settings.kafka_topic_ingestion,
+            Event(
+                event_type=DOCUMENT_UPLOADED,
+                document_id=document_id,
+                payload={
+                    "storage_key": storage_key,
+                    "filename": safe_name,
+                    "department": department,
+                    "checksum": checksum,
+                },
+                request_id=request_id,
+            ),
+        )
+    except Exception as e:
+        # Leave a durable trace of the failure. The document is now FAILED,
+        # so a re-upload takes the reset-and-requeue branch above rather
+        # than being mistaken for an already-accepted duplicate.
+        registry.mark_failed(document_id, f"{type(e).__name__}: {e}")
+        logger.exception("Failed to enqueue document %s for ingestion", document_id)
+        raise
+
+    logger.info(
+        "Accepted %s (%d bytes) as document %s — queued for indexing",
+        safe_name, len(content), document_id,
+    )
+    return (
+        UploadAcceptedResponse(
+            document_id=document_id,
+            filename=safe_name,
+            department=department,
+            status=STATUS_PENDING,
+            duplicate=False,
+            checksum=checksum,
+            size_bytes=len(content),
+            storage_uri=storage_uri,
+            status_url=f"/documents/{document_id}",
+            message="Accepted for indexing. Poll the status URL until status is PROCESSED.",
+        ),
+        202,
+    )
+
+
+@app.post(
+    "/upload",
+    response_model=None,
+    responses={
+        200: {"model": UploadResponse, "description": "Indexed inline (ASYNC_INGESTION=false) or duplicate"},
+        202: {"model": UploadAcceptedResponse, "description": "Stored and queued for indexing"},
+        400: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
 @limiter.limit(settings.heavy_rate_limit)
-async def upload_endpoint(request: Request, file: UploadFile, department: str = "general"):
-    """Upload a document file (PDF, TXT, or MD) and ingest it into the vector store."""
+async def upload_endpoint(
+    request: Request,
+    response: Response,
+    file: UploadFile,
+    department_form: str | None = Form(None, alias="department"),
+    department_query: str | None = Query(None, alias="department"),
+):
+    """Upload a document (PDF, DOCX, CSV, TXT or MD) for indexing.
+
+    With ASYNC_INGESTION=true the file is stored durably and queued, and
+    this returns 202 immediately — poll GET /documents/{document_id} for
+    progress. Otherwise the document is parsed and indexed inline and the
+    chunk counts are returned.
+
+    *department* is accepted as either a multipart form field or a query
+    parameter. It must be declared both ways: a bare ``str`` default makes
+    FastAPI read it from the query string only, so the form field browsers
+    and the Streamlit UI actually send was being silently discarded and
+    every upload filed itself under "general" — which also meant legal and
+    security documents never received their "confidential" access level.
+    """
     from api.models import VALID_DEPARTMENTS
+
+    department = department_form or department_query or "general"
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
@@ -643,49 +896,109 @@ async def upload_endpoint(request: Request, file: UploadFile, department: str = 
         )
 
     try:
-        from src.ingestion.chunker import chunk_documents
-        from src.ingestion.loader import load_path
-        from src.vectorstore.chroma_store import add_chunks, collection_stats
-
-        # Save uploaded file to a temp directory so the loader can read it
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dept_dir = Path(tmpdir) / department
-            dept_dir.mkdir()
-            dest = dept_dir / safe_name
-            dest.write_bytes(content)
-            logger.info(
-                "Upload: saved %s (%d bytes) to temp dir, department=%s",
-                safe_name, len(content), department,
+        if settings.async_ingestion:
+            accepted, status_code = await asyncio.to_thread(
+                _upload_async,
+                content,
+                safe_name,
+                department,
+                content_type,
+                getattr(request.state, "api_key_id", ""),
+                get_request_id(),
             )
+            response.status_code = status_code
+            return accepted
 
-            docs = load_path(tmpdir)
-
-            # Rewrite source metadata: replace temp path with a stable
-            # identifier so citations are meaningful and content-hash
-            # deduplication works across re-uploads of the same file.
-            stable_source = f"uploads/{department}/{safe_name}"
-            for doc in docs:
-                doc.metadata["source"] = stable_source
-
-            chunks = chunk_documents(docs)
-            added = add_chunks(chunks)
-            stats = collection_stats()
-
-        logger.info(
-            "Upload complete: %s -> %d docs, %d chunks, %d new (total %d)",
-            safe_name, len(docs), len(chunks), added,
-            stats["document_count"],
-        )
-        return UploadResponse(
-            filename=safe_name,
-            documents_loaded=len(docs),
-            chunks_created=len(chunks),
-            chunks_added=added,
-            collection_total=stats["document_count"],
-        )
+        return await asyncio.to_thread(_upload_sync, content, safe_name, department)
     except Exception as e:
         logger.exception("Upload endpoint failed for file: %s", safe_name)
         raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /documents — ingestion status
+# ---------------------------------------------------------------------------
+
+def _to_status_response(record) -> DocumentStatusResponse:
+    return DocumentStatusResponse(
+        document_id=record.document_id,
+        filename=record.filename,
+        department=record.department,
+        status=record.status,
+        attempts=record.attempts,
+        chunks_indexed=record.chunks_indexed,
+        size_bytes=record.size_bytes,
+        checksum=record.checksum,
+        content_type=record.content_type,
+        storage_uri=record.storage_uri,
+        error=record.error if settings.debug_mode else ("" if not record.error else "Indexing failed"),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _owns_document(request: Request, record) -> bool:
+    """Whether the caller may see *record*.
+
+    When auth is on, a document is visible to the key that uploaded it.
+    Mirrors how conversation sessions are scoped — without it, any
+    authenticated caller could enumerate every other tenant's filenames.
+    """
+    caller = getattr(request.state, "api_key_id", "")
+    if not caller:
+        return True  # auth disabled: single-tenant dev mode
+    return not record.uploaded_by or record.uploaded_by == caller
+
+
+@app.get(
+    "/documents/{document_id}",
+    response_model=DocumentStatusResponse,
+    responses={404: {"model": ErrorResponse}},
+    dependencies=[Depends(verify_api_key)],
+)
+async def document_status_endpoint(request: Request, document_id: str):
+    """Current lifecycle state of an uploaded document."""
+    from src.ingestion.registry import get_registry
+
+    record = await asyncio.to_thread(get_registry().get, document_id)
+    # 404 rather than 403 for someone else's document: a distinguishable
+    # response would confirm the id exists.
+    if record is None or not _owns_document(request, record):
+        raise HTTPException(status_code=404, detail=f"Unknown document: {document_id}")
+    return _to_status_response(record)
+
+
+@app.get(
+    "/documents",
+    response_model=DocumentListResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_documents_endpoint(
+    request: Request,
+    status: str | None = None,
+    department: str | None = None,
+    limit: int = 50,
+):
+    """List registered documents, most recent first, with per-status counts."""
+    from src.ingestion.registry import VALID_STATUSES, get_registry
+
+    if status and status.upper() not in VALID_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{status}'. Allowed: {', '.join(sorted(VALID_STATUSES))}",
+        )
+
+    registry = get_registry()
+    records = await asyncio.to_thread(
+        registry.list_documents, status, department, max(1, min(limit, 500))
+    )
+    visible = [r for r in records if _owns_document(request, r)]
+    stats = await asyncio.to_thread(registry.stats)
+    return DocumentListResponse(
+        documents=[_to_status_response(r) for r in visible],
+        count=len(visible),
+        stats=stats,
+    )
 
 
 # ---------------------------------------------------------------------------

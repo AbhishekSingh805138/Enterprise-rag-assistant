@@ -175,19 +175,23 @@
                        INDEXING / INGESTION PIPELINE
   ============================================================================
 
+  Shared indexing steps (used by both the sync and async paths):
+
   +----------+    +--------------+    +------------------+    +-------------+
-  | PDF/TXT/ |--->| Loader       |--->| Chunker          |--->| ChromaDB    |
-  | MD files |    | PyPDFLoader  |    | Markdown-aware   |    | add_chunks  |
-  |          |    | TextLoader   |    | H1/H2/H3 split  |    |             |
-  +----------+    | + metadata:  |    | then Recursive   |    | SHA-256 ID  |
-                  |  department  |    | size=1000        |    | dedup on    |
-                  |  access_lvl  |    | overlap=200      |    | re-ingest   |
-                  |  ingested_at |    | seps: \n\n,\n,.  |    |             |
-                  +--------------+    +------------------+    | + BM25 cache|
-                                                              |   invalidate|
-                                                              | + KG extract|
+  | PDF/DOCX/|--->| Loader       |--->| Chunker          |--->| ChromaDB    |
+  | CSV/TXT/ |    | PyPDFLoader  |    | Markdown-aware   |    | add_chunks  |
+  | MD files |    | Docx2txt     |    | H1/H2/H3 split  |    |             |
+  |          |    | CSVLoader    |    | then Recursive   |    | SHA-256 ID  |
+  +----------+    | TextLoader   |    | size=1000        |    | dedup on    |
+                  | + metadata:  |    | overlap=200      |    | re-ingest   |
+                  |  department  |    | seps: \n\n,\n,.  |    |             |
+                  |  access_lvl  |    +------------------+    | + BM25 cache|
+                  |  ingested_at |                            |   invalidate|
+                  +--------------+                            | + KG extract|
                                                               |   (if on)   |
                                                               +-------------+
+
+  How those steps are driven depends on ASYNC_INGESTION — see §1.2.
 
   ============================================================================
                      RESILIENCE & OBSERVABILITY
@@ -232,6 +236,128 @@
                           | - Embedding vecs  |
                           +-------------------+
 ```
+
+---
+
+## 1.2 Asynchronous Ingestion Pipeline
+
+Enabled with `ASYNC_INGESTION=true`. The upload request stops doing the
+expensive work: it persists the file, records it, publishes an event and
+returns `202`. A separate worker process does the parsing and embedding.
+
+```
+  CLIENT                       API (FastAPI)
+  +--------+  POST /upload   +--------------------------------------+
+  | Client |---------------->| 1. Validate (.pdf/.docx/.csv/        |
+  +--------+                 |    .txt/.md, MIME, size, department) |
+      ^                      | 2. SHA-256 -> document_id            |
+      |  202 Accepted        | 3. Idempotency check (registry)      |
+      |  {document_id}       | 4. Store bytes  (S3 / local)         |
+      +----------------------| 5. Publish event (Kafka / SQLite)    |
+                             +------------------+-------------------+
+                                                |
+                    Document Already Exists?    |
+                    +-----------+---------------+
+                    | YES                       | NO
+                    v                           v
+        +-------------------------+   +-----------------------+
+        | 200 + existing          |   | Store to object store |
+        | document_id             |   | Publish event         |
+        | duplicate=true          |   | 202 Accepted          |
+        | (no work re-queued)     |   +-----------+-----------+
+        +-------------------------+               |
+  ..............................................  |  .....................
+                                                  v
+                            +---------------------------------+
+                            |  Topic: document.uploaded       |
+                            |  (Kafka, or durable SQLite      |
+                            |   queue with visibility timeout)|
+                            +----------------+----------------+
+                                             |
+                            +----------------v----------------+
+                            |      INGESTION WORKER           |
+                            |   python -m scripts.worker      |
+                            +----------------+----------------+
+                                             |
+                                   Already Indexed?
+                             +---------------+---------------+
+                             | YES                           | NO
+                             v                               v
+                    +-----------------+       +-------------------------+
+                    | Ack / ignore    |       | Download from storage   |
+                    | (no re-embed)   |       | Parse document          |
+                    +-----------------+       | Split into chunks       |
+                                              | Generate embeddings     |
+                                              | Store in vector DB      |
+                                              | Mark PROCESSED          |
+                                              +-----------+-------------+
+                                                          |
+                                              Any failure during processing?
+                                                          |
+                    +-------------------------------------+
+                    |
+                    v
+          +--------------------+   attempts < 3    +---------------------+
+          | Permanent?         |------------------>| Retry with          |
+          | (parse error /     |   (transient)     | exponential backoff |
+          |  object missing)   |                   | attempt+1 re-queued |
+          +---------+----------+                   +---------------------+
+                    | yes, or attempts >= 3
+                    v
+          +-------------------------------+
+          | Dead Letter Queue             |
+          | topic: document.uploaded.dlq  |
+          | registry status: DEAD_LETTER  |
+          +-------------------------------+
+```
+
+### Components
+
+| Component | Module | Backends |
+|-----------|--------|----------|
+| Object storage | `src/storage/object_store.py` | `local` (filesystem, default), `s3` (boto3 / MinIO) |
+| Event bus | `src/events/` | `sqlite` (durable queue, default), `kafka` |
+| Document registry | `src/ingestion/registry.py` | SQLite (WAL, shared across processes) |
+| Indexing steps | `src/ingestion/pipeline.py` | reuses loader/chunker/chroma_store unchanged |
+| Worker | `src/ingestion/worker.py`, `scripts/worker.py` | — |
+
+Both backend pairs exist for the same reason: the default (`local` +
+`sqlite`) needs no broker and no cloud account, so a developer clone and
+the CI suite exercise the *same* retry and dead-letter code paths that
+production runs on Kafka and S3.
+
+### Idempotency
+
+Identity is `sha256(file_bytes)` + department, so the document id is
+derived rather than random. Two things follow:
+
+- **At the API.** A repeat upload is recognised before anything is stored
+  or queued, and returns `200` with the original id. The parse and embed
+  cost is never paid twice. (Chunk-level dedup in the vector store still
+  applies underneath, but it only fires *after* embedding.)
+- **At the worker.** Queues deliver at-least-once, so a redelivered event
+  is expected. `claim_for_processing` is a conditional `UPDATE`, so only
+  one worker wins; a document already `PROCESSED` is acked, not re-embedded.
+
+### Failure handling
+
+| Failure | Behaviour |
+|---------|-----------|
+| Transient (embedding 429, vector store blip) | Retried up to `INGEST_MAX_ATTEMPTS` (3) with exponential backoff |
+| Permanent (corrupt file, object missing) | Dead-lettered immediately — retrying cannot change the outcome |
+| Worker killed mid-document | Visibility timeout redelivers the event; the stale `PROCESSING` claim is reclaimable so the document is not stranded |
+| DLQ publish fails | Registry still records `DEAD_LETTER`, so the document is never silently lost |
+| Retry publish fails | Original event is left unacked for redelivery rather than dropped |
+
+### Observability
+
+`GET /documents/{id}` returns the lifecycle state; `GET /documents`
+lists documents with per-status counts. `GET /health?deep=true` adds
+object-store reachability, queue backlog and **DLQ depth** — a non-zero
+dead-letter count means documents were accepted from users and never
+indexed, which is otherwise invisible from the query side. With
+`JSON_LOGS=true` each line carries the `X-Request-ID`, so one upload can
+be followed across API, queue and worker.
 
 ---
 
@@ -334,26 +460,50 @@ down; both default off so behavior is unchanged unless enabled.
 
 ---
 
+### 2.5 Async Ingestion Pipeline (Phase 22)
+
+Ingestion was the last part of the system still doing unbounded work
+inside a request. `POST /upload` read the file into memory, wrote it to a
+`TemporaryDirectory`, parsed, embedded and indexed it, then deleted the
+file. The consequences were all on the ingestion side:
+
+| Problem | Fix |
+|---------|-----|
+| Request blocked for the full embed duration (UI timed out at 60s on large PDFs) | `202 Accepted` — indexing moved to a worker |
+| No durable copy of the upload; the only copy was deleted with the temp dir | Bytes persisted to object storage before the response |
+| A transient OpenAI 429 lost the upload with no record it had happened | Retry with backoff, then DLQ; every attempt recorded |
+| Idempotency only at chunk level, so re-uploads paid the full parse + embed cost | Content-addressed document ids — duplicates rejected before any work |
+| No way to ask "did my upload succeed?" | `GET /documents/{id}` lifecycle status |
+| Ingestion competed with query traffic in one process | Workers scale independently (`--scale worker=N`) |
+| `department` read as a query param only, so the form field the UI sends was discarded — every upload filed as "general", and legal/security docs never got `confidential` access level | Bound from both form and query |
+| Sync upload ran blocking I/O directly in an `async def`, stalling the event loop for every concurrent request | Moved to `asyncio.to_thread` |
+
+The synchronous path is unchanged and remains the default
+(`ASYNC_INGESTION=false`); `docker-compose.prod.yml` enables the async
+pipeline with Kafka and MinIO.
+
+---
+
 ## 3. Production Gap Analysis
 
 ### Critical Gaps
 
-| Gap | Impact | Effort |
-|-----|--------|--------|
-| No horizontal scaling (single-process) | Cannot handle >50 concurrent users | High |
-| SQLite for all stores (not suitable for concurrent writes) | Write contention under load | High |
-| No request tracing (X-Request-ID) | Cannot debug distributed issues | Low |
-| Cost budget not enforced (only logged) | Runaway costs on expensive queries | Medium |
+| Gap | Impact | Effort | Status |
+|-----|--------|--------|--------|
+| No horizontal scaling (single-process) | Cannot handle >50 concurrent users | High | Partly closed — ingestion workers scale out; query pods still need shared Redis/Postgres |
+| SQLite for all stores (not suitable for concurrent writes) | Write contention under load | High | Open (registry/queue use WAL, which is adequate for a single node) |
+| No request tracing (X-Request-ID) | Cannot debug distributed issues | Low | **Closed** — request-id middleware + `JSON_LOGS` |
+| Cost budget not enforced (only logged) | Runaway costs on expensive queries | Medium | Open |
 
 ### Recommended Gaps (Medium Priority)
 
-| Gap | Impact | Effort |
-|-----|--------|--------|
-| No retry with exponential backoff on LLM calls | Transient failures not recovered | Low |
-| No structured logging (JSON) | Hard to parse in log aggregators | Low |
-| No Prometheus metrics export | No dashboarding or alerting | Medium |
-| No document versioning | Can't track what changed when | Medium |
-| No A/B testing framework | Can't compare retrieval strategies in production | Medium |
+| Gap | Impact | Effort | Status |
+|-----|--------|--------|--------|
+| No retry with exponential backoff on LLM calls | Transient failures not recovered | Low | Closed for ingestion; query path still relies on the circuit breaker |
+| No structured logging (JSON) | Hard to parse in log aggregators | Low | **Closed** — `JSON_LOGS=true` |
+| No Prometheus metrics export | No dashboarding or alerting | Medium | Open (`/health?deep=true` exposes queue/DLQ depth in the meantime) |
+| No document versioning | Can't track what changed when | Medium | Partly closed — every document has a checksum, storage key and audit timestamps |
+| No A/B testing framework | Can't compare retrieval strategies in production | Medium | Open |
 
 ---
 
@@ -452,6 +602,9 @@ def count_tokens(text: str) -> int:
 | Auth | Static API keys | OAuth2 / JWT with JWKS |
 | Orchestration | LangGraph (single process) | LangGraph + Celery workers |
 | Deployment | uvicorn single process | Kubernetes + horizontal pod autoscaler |
+| Document storage | Local filesystem (`STORAGE_BACKEND=local`) | S3 / MinIO (`STORAGE_BACKEND=s3`) |
+| Ingestion queue | SQLite queue (`EVENT_BUS=sqlite`) | Kafka (`EVENT_BUS=kafka`) |
+| Ingestion compute | Inline in the request | Dedicated worker processes (`scripts/worker.py`) |
 
 ---
 

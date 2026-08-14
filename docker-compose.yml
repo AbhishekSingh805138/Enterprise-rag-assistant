@@ -1,3 +1,16 @@
+# ============================================================
+# Development Docker Compose — Enterprise RAG Assistant
+#
+# Async ingestion is off by default here, so /upload stays synchronous
+# and no extra services are needed. To exercise the event-driven pipeline
+# locally without Kafka or MinIO, set ASYNC_INGESTION=true in .env and
+# start the worker profile:
+#   docker-compose --profile async up
+# The api and worker containers share the object store and queue through
+# the checkpoint/object volumes below.
+# For the full Kafka + MinIO topology see docker-compose.prod.yml.
+# ============================================================
+
 services:
   api:
     build: .
@@ -6,6 +19,7 @@ services:
     volumes:
       - ./chroma_db:/app/chroma_db
       - ./checkpoints:/app/checkpoints
+      - ./object_store:/app/object_store
       - ./data:/app/data:ro
     env_file: .env
     healthcheck:
@@ -13,6 +27,28 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  worker:
+    build: .
+    command: python -m scripts.worker
+    profiles: ["async"]
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./checkpoints:/app/checkpoints
+      - ./object_store:/app/object_store
+    env_file: .env
+    environment:
+      # The SQLite queue is a shared file, so both containers must agree
+      # on its path — and it must live on the mounted volume.
+      - ASYNC_INGESTION=true
+      - EVENT_BUS=sqlite
+      - EVENT_BUS_PATH=/app/checkpoints/event_bus.db
+      - STORAGE_BACKEND=local
+      - STORAGE_LOCAL_DIR=/app/object_store
+    depends_on:
+      api:
+        condition: service_started
+    stop_grace_period: 60s
 
   ui:
     build: .

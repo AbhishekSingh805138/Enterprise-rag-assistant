@@ -46,6 +46,10 @@ def client():
         mock_settings.cors_allow_methods = "GET,POST,OPTIONS"
         mock_settings.cors_allow_headers = "Content-Type,Authorization,X-Request-ID"
         mock_settings.ingest_root = "./data"
+        # Matches the production default. Must be explicit: an unset
+        # attribute on a MagicMock is truthy, which would silently route
+        # these tests down the async ingestion path.
+        mock_settings.async_ingestion = False
 
         from api.app import app
         with TestClient(app) as tc:

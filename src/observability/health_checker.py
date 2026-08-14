@@ -120,6 +120,87 @@ def _check_memory() -> HealthCheck:
         )
 
 
+def _check_object_store() -> HealthCheck:
+    """Verify the object store answers — uploads fail hard without it."""
+    start = time.perf_counter()
+    try:
+        from src.storage.object_store import get_object_store
+
+        store = get_object_store()
+        # Probe with a key that will not exist: exercises the connection
+        # (and, for S3, credentials) without writing anything.
+        store.exists("__healthcheck__/probe")
+        latency = (time.perf_counter() - start) * 1000
+        return HealthCheck(
+            name="object_store", status="ok", latency_ms=latency,
+            detail=f"{settings.storage_backend} backend reachable",
+        )
+    except Exception as e:
+        latency = (time.perf_counter() - start) * 1000
+        return HealthCheck(
+            name="object_store", status="error", latency_ms=latency,
+            detail=str(e) if settings.debug_mode else "Object store unavailable",
+        )
+
+
+def _check_ingestion_queue() -> HealthCheck:
+    """Report queue depth and, more importantly, dead-letter depth.
+
+    A growing backlog means workers cannot keep up; any dead-letter depth
+    at all means documents were accepted from users and never indexed,
+    which is invisible from the query side.
+    """
+    start = time.perf_counter()
+    try:
+        from src.events.bus import get_event_bus
+
+        bus = get_event_bus()
+        latency = (time.perf_counter() - start) * 1000
+        if not hasattr(bus, "depth"):
+            return HealthCheck(
+                name="ingestion_queue", status="ok", latency_ms=latency,
+                detail=f"{settings.event_bus} backend (depth not reported)",
+            )
+        backlog = bus.depth(settings.kafka_topic_ingestion)
+        dlq = bus.depth(settings.kafka_topic_dlq)
+        status = "degraded" if dlq > 0 else "ok"
+        return HealthCheck(
+            name="ingestion_queue", status=status, latency_ms=latency,
+            detail=f"backlog={backlog} dlq={dlq}",
+        )
+    except Exception as e:
+        latency = (time.perf_counter() - start) * 1000
+        return HealthCheck(
+            name="ingestion_queue", status="error", latency_ms=latency,
+            detail=str(e) if settings.debug_mode else "Event bus unavailable",
+        )
+
+
+def _check_document_registry() -> HealthCheck:
+    """Surface documents stuck in a non-terminal or dead-lettered state."""
+    start = time.perf_counter()
+    try:
+        from src.ingestion.registry import get_registry
+
+        stats = get_registry().stats()
+        latency = (time.perf_counter() - start) * 1000
+        status = "degraded" if stats.get("DEAD_LETTER", 0) > 0 else "ok"
+        return HealthCheck(
+            name="document_registry", status=status, latency_ms=latency,
+            detail=(
+                f"total={stats.get('TOTAL', 0)} processed={stats.get('PROCESSED', 0)} "
+                f"pending={stats.get('PENDING', 0)} failed={stats.get('FAILED', 0)} "
+                f"dead_letter={stats.get('DEAD_LETTER', 0)}"
+            ),
+        )
+    except Exception as e:
+        latency = (time.perf_counter() - start) * 1000
+        return HealthCheck(
+            name="document_registry", status="error", latency_ms=latency,
+            detail=str(e) if settings.debug_mode else "Document registry unavailable",
+        )
+
+
 def deep_health_check() -> DeepHealthResult:
     """Run all health checks and return aggregated result."""
     checks = [
@@ -127,6 +208,14 @@ def deep_health_check() -> DeepHealthResult:
         _check_sqlite(),
         _check_memory(),
     ]
+
+    # Only meaningful when the async pipeline is the active upload path.
+    if settings.async_ingestion:
+        checks.extend([
+            _check_object_store(),
+            _check_ingestion_queue(),
+            _check_document_registry(),
+        ])
 
     # Aggregate status: error if any error, degraded if any degraded, else ok
     statuses = {c.status for c in checks}
