@@ -329,7 +329,7 @@ enterprise-rag-assistant/
 │   ├── metrics.py             # Metrics dashboard CLI
 │   └── upload_eval_dataset.py # Evaluation dataset uploader
 │
-├── tests/                     # 860+ tests across 42 files
+├── tests/                     # 1130 tests across 48 files (93% coverage)
 │   ├── conftest.py            # Shared fixtures
 │   └── test_*.py              # Unit, integration, and e2e tests
 │
@@ -1003,7 +1003,7 @@ requeues it.
 
 ## Testing
 
-The project has **868 tests** across 42 test files covering unit, integration, and end-to-end scenarios.
+The project has **1130 tests** across 48 test files covering unit, integration, and end-to-end scenarios, at **93% line coverage**.
 
 ```bash
 # Run all tests
@@ -1044,11 +1044,31 @@ pytest tests/test_e2e_smoke.py -v
 | Document registry & idempotency | 37+ | `test_phase22_registry.py` |
 | Ingestion worker (retry/DLQ) | 24+ | `test_phase22_worker.py` |
 | Async upload API | 39+ | `test_phase22_upload_async.py` |
+| Object storage (local + S3) | 40+ | `test_phase22_storage.py` |
+| Kafka transport | 49+ | `test_phase23_kafka_bus.py` |
+| Evaluation harness | 31+ | `test_phase23_eval_harness.py` |
+| Health checks | 33+ | `test_phase23_health_checks.py` |
+| Two-stage retrieval | 28+ | `test_phase23_retrievers.py` |
+| Vector store wrapper | 36+ | `test_phase23_vectorstore.py` |
+| Config, logging & edge paths | 66+ | `test_phase23_config_and_ingestion_edges.py` |
 | Integration & E2E | 46+ | `test_integration.py`, `test_e2e_smoke.py` |
 
 The ingestion suites run against the real SQLite queue, a real registry and a
 temp-directory object store, so retry, dead-lettering, visibility timeouts and
 concurrent-claim races are exercised for real rather than mocked.
+
+Optional dependencies (`kafka-python`, `boto3`, `sentence-transformers`) are
+driven through injected fakes rather than skipped. That keeps the Kafka and S3
+backends — the ones production actually runs on — covered in a CI environment
+where those packages and services are absent.
+
+```bash
+# Coverage report
+pytest --cov=src --cov=api --cov=config --cov-report=term-missing
+
+# HTML report
+pytest --cov=src --cov=api --cov=config --cov-report=html && open htmlcov/index.html
+```
 
 ---
 
