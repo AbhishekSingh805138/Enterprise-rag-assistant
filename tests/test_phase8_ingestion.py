@@ -15,7 +15,6 @@ from unittest.mock import patch
 import pytest
 from langchain_core.documents import Document
 
-
 # ---------------------------------------------------------------------------
 # TestMarkdownChunking
 # ---------------------------------------------------------------------------

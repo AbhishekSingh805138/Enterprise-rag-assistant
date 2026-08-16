@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # ---------------------------------------------------------------------------
 # TestConfigPhase8
 # ---------------------------------------------------------------------------
@@ -82,22 +81,30 @@ class TestConfigPhase8:
 class TestLLMTimeout:
     """Verify _llm() passes timeout and max_retries from settings."""
 
-    @patch("src.llm_pool.settings")
-    def test_nodes_llm_passes_timeout(self, mock_settings):
-        # _llm() delegates to the llm_pool, which reads src.llm_pool.settings
-        # at instance-creation time and caches by (model, temperature) —
-        # so patch the pool's settings and reset the pool around the test.
-        mock_settings.llm_model = "gpt-4o-mini"
-        mock_settings.openai_api_key = "sk-test"
-        mock_settings.llm_timeout = 45
-        mock_settings.llm_max_retries = 3
-
-        from src.llm_pool import reset_pool
+    def test_nodes_llm_passes_timeout(self):
+        # _llm() delegates to the llm_pool, which caches by
+        # (model, temperature) — so reset the pool around the test.
+        #
+        # Both modules are patched because construction is split: the pool
+        # chooses the provider and model, and src.llm.providers applies the
+        # timeout and retry budget to the client it builds.
         from src.graph.nodes import _llm
+        from src.llm_pool import reset_pool
+
+        pool_settings = MagicMock(
+            llm_model="gpt-4o-mini", llm_provider="openai", llm_fallback_provider=""
+        )
+        provider_settings = MagicMock(
+            openai_api_key="sk-test", llm_timeout=45, llm_max_retries=3
+        )
 
         reset_pool()
         try:
-            llm = _llm()
+            with (
+                patch("src.llm_pool.settings", pool_settings),
+                patch("src.llm.providers.settings", provider_settings),
+            ):
+                llm = _llm()
             assert llm.request_timeout == 45
             assert llm.max_retries == 3
         finally:

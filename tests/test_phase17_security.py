@@ -50,6 +50,7 @@ class TestAuth:
         _set_setting("auth_enabled", True)
         _set_setting("api_keys", "test-key-123")
         from fastapi import HTTPException
+
         from src.security.auth import verify_api_key
         request = MagicMock()
         request.headers = {}
@@ -62,6 +63,7 @@ class TestAuth:
         _set_setting("auth_enabled", True)
         _set_setting("api_keys", "valid-key")
         from fastapi import HTTPException
+
         from src.security.auth import verify_api_key
         request = MagicMock()
         request.headers = {"Authorization": "Bearer wrong-key"}
@@ -85,6 +87,7 @@ class TestAuth:
         _set_setting("auth_enabled", True)
         _set_setting("api_keys", "")
         from fastapi import HTTPException
+
         from src.security.auth import verify_api_key
         request = MagicMock()
         request.headers = {"Authorization": "Bearer some-key"}
@@ -97,6 +100,7 @@ class TestAuth:
         _set_setting("auth_enabled", True)
         _set_setting("api_keys", "test-key")
         from fastapi import HTTPException
+
         from src.security.auth import verify_api_key
         request = MagicMock()
         request.headers = {"Authorization": "Basic test-key"}

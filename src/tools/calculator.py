@@ -86,7 +86,7 @@ def _safe_eval(node: ast.AST) -> float:
                 raise ValueError(f"'{node.func.id}' is not callable")
             args = [_safe_eval(arg) for arg in node.args]
             return float(func(*args))
-        raise ValueError(f"Unsupported function call")
+        raise ValueError("Unsupported function call")
     raise ValueError(f"Unsupported expression: {ast.dump(node)}")
 
 

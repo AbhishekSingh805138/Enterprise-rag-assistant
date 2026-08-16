@@ -21,10 +21,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -130,11 +129,11 @@ def save_results(
     results_dir = Path(__file__).parent.parent.parent / "eval_results"
     results_dir.mkdir(exist_ok=True)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     filename = output_path or str(results_dir / f"{mode}_{retriever}_{timestamp}.json")
 
     payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "mode": mode,
         "retriever": retriever,
         "num_items": num_items,
@@ -221,7 +220,7 @@ def main() -> None:
 
     for metric, value in sorted(scores.items()):
         if isinstance(value, float):
-            target = prd_targets.get(metric, None)
+            target = prd_targets.get(metric)
             status = ""
             if target is not None:
                 status = " PASS" if value >= target else " FAIL"

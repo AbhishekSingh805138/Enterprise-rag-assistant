@@ -23,7 +23,6 @@ from src.observability.cost_callback import (
 )
 from src.observability.metrics_store import COST_BUDGET, MetricsStore, reset_store
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -358,6 +357,7 @@ class TestConfigPhase6:
 
     def test_langsmith_warning_without_key(self):
         from dataclasses import replace
+
         from config import settings
 
         cfg = replace(

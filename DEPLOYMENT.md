@@ -832,20 +832,38 @@ git checkout main
 docker compose -f docker-compose.prod.yml up --build -d
 ```
 
-### Data Rollback
+### Backup and Restore
 
-Vector store and SQLite data persist in volumes. To backup:
+State lives in three Docker volumes, not inside the application containers:
+
+| Volume | Contents | Rebuildable? |
+|--------|----------|--------------|
+| `chroma_data` | Vector index | Only by re-embedding everything — the expensive one |
+| `checkpoint_data` | Document registry, metrics, conversation memory, event queue | No |
+| `minio_data` | Original uploaded bytes | No — and required to re-index anything |
+
+Kafka is deliberately **not** backed up: it holds in-flight events, all of
+which are reconstructable from the registry plus object storage.
 
 ```bash
-# Backup (run periodically via cron)
-docker compose -f docker-compose.prod.yml exec api tar czf /tmp/backup.tar.gz /app/chroma_db /app/checkpoints
-docker cp $(docker compose -f docker-compose.prod.yml ps -q api):/tmp/backup.tar.gz ./backup-$(date +%Y%m%d).tar.gz
-
-# Restore
-docker cp backup-20260606.tar.gz $(docker compose -f docker-compose.prod.yml ps -q api):/tmp/
-docker compose -f docker-compose.prod.yml exec api tar xzf /tmp/backup-20260606.tar.gz -C /
-docker compose -f docker-compose.prod.yml restart api
+./scripts/backup.sh backup                    # -> backups/<timestamp>/
+./scripts/backup.sh verify backups/<ts>       # prove it is restorable
+./scripts/backup.sh restore backups/<ts>      # verify, stop, replace, restart
 ```
+
+`verify` runs automatically before any restore. It lists each archive and
+fails if one is empty, and checks the manifest's recorded document count.
+
+> **Why this replaced the previous procedure.** The old command ran
+> `tar` on `/app/chroma_db` *inside the api container*. Since the move to
+> `CHROMA_MODE=server`, api no longer mounts that path — vectors live in
+> the `chroma` service's volume. The command still exited 0 and produced a
+> plausible-looking archive containing nothing. Backups appeared healthy
+> right up until a restore returned an empty index. `verify` exists
+> specifically so that class of silent failure cannot recur.
+
+**Run `verify` on a schedule, not just after backing up.** A backup that has
+never been restored is a hypothesis.
 
 ### Emergency: Full Reset
 

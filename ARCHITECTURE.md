@@ -480,7 +480,92 @@ file. The consequences were all on the ingestion side:
 
 The synchronous path is unchanged and remains the default
 (`ASYNC_INGESTION=false`); `docker-compose.prod.yml` enables the async
-pipeline with Kafka and MinIO.
+pipeline with Kafka, MinIO and a ChromaDB server.
+
+### 2.6 Cross-process index visibility (found by running the app)
+
+Moving indexing to a worker introduced a defect that no unit test caught,
+because it only exists between processes: **the API served answers from a
+corpus that predated every uploaded document, indefinitely.** An upload
+reported `PROCESSED`, the chunks were in ChromaDB, and the running API
+still could not retrieve them until it was restarted.
+
+Two independent caches were at fault, and both had to be fixed:
+
+| Layer | Why it went stale | Fix |
+|-------|-------------------|-----|
+| **Dense** | chromadb's `PersistentClient` is a process-level singleton keyed by path, holding its index in memory. `get_vectorstore()`'s periodic recycle discards the LangChain wrapper but reuses that same client, so another process's writes were never visible — the refresh was a no-op for this purpose. | `CHROMA_MODE=server` routes every read through one ChromaDB server. Mandatory for any multi-process deployment. |
+| **Sparse** | The BM25 index is an in-memory copy of the corpus, invalidated by `reset_bm25_cache()` — which the worker only calls in *its own* process. It had no TTL, so an API server's sparse index never rebuilt. | Corpus-size check per lookup (catches adds/deletes at once) plus `BM25_CACHE_TTL` as a backstop for changes that cancel out. |
+
+`CHROMA_MODE=embedded` remains the default and is correct for
+single-process use. Choosing `ASYNC_INGESTION=true` alongside it now
+raises a startup warning and degrades the `chromadb` health check,
+because that combination silently serves stale results.
+
+A related crash was found while testing the BM25 fix: a corpus whose
+documents all tokenize to nothing (stop-words only) made `BM25Okapi`
+divide by zero and took hybrid retrieval down. It now degrades to
+dense-only.
+
+### 2.7 Capability-aware validation and DLQ recovery
+
+Two further defects surfaced from an audit of the running system.
+
+**Validation promised a capability the runtime lacked.** `.docx` was in the
+accepted-extensions list, but its parser dependency was not installed, so an
+upload returned `202 Accepted` and dead-lettered two seconds later — the
+caller was told "accepted" for work guaranteed to fail, and never learned
+why. Validation now derives from `loader.available_suffixes()`, which probes
+the optional dependency, and an unavailable-but-known type is refused with
+`415` naming the missing package. Availability is logged at startup, so a
+degraded deployment is visible at boot rather than on the first upload.
+
+**The dead-letter queue had no way out.** Documents landed there and stayed,
+even though their bytes were still in object storage and the registry knew
+exactly what had failed — the only recovery was asking the user to upload
+the file again. `src/ingestion/replay.py` adds both a targeted replay
+(`POST /documents/{id}/retry`) and a full redrive (`scripts/replay_dlq.py`)
+that consumes the dead-letter topic, so its depth actually returns to zero.
+
+| Property | Behaviour |
+|----------|-----------|
+| Retry budget | Reset to zero; a replayed document gets the full policy, not one attempt from exhaustion |
+| Idempotency | Already-indexed documents are skipped, never re-embedded |
+| Unrecoverable input | A document whose stored object is gone is reported as needing a genuine re-upload, not queued to fail again |
+| Poison events | Acknowledged even when unreplayable, so an unfixable document cannot be redriven forever |
+| Preview | `--dry-run` claims and releases without draining |
+
+Verified end to end against the running system: stopping the vector store
+mid-flight produced a real dead-letter after 3 attempts; restarting it and
+running the redrive recovered the document to `PROCESSED` in 3 seconds, and
+it answered a query — without the file ever being uploaded again.
+
+### 2.8 Integration testing the production backends
+
+Kafka and S3 were covered only by unit tests against injected fakes. Those
+prove call contracts — offsets committed at `offset+1`, `NoSuchKey` mapped
+to a permanent failure — but they cannot prove the deployment works, and
+**every defect below was invisible to 1216 passing unit tests.** Bringing
+the stack up for the first time found four:
+
+| Defect | Consequence had it shipped |
+|--------|----------------------------|
+| `bitnami/kafka:3.8` withdrawn from Docker Hub | `docker compose up` fails at image pull; the stack never starts |
+| Chroma server pinned to `0.6.3` against a `1.5.x` client | Every collection call fails with an opaque `KeyError('_type')` |
+| Chroma healthcheck used `/bin/sh` with `/dev/tcp` | The image ships dash, where `/dev/tcp` does not exist, so the probe can never pass — `api` and `worker` wait on `service_healthy` forever and the deployment deadlocks |
+| `kafka-python` does not import on Python 3.12+ | Worker crashes at startup on a modern runtime |
+
+`tests/integration/` now drives the real backends: Kafka round-trips,
+offset-commit semantics, redelivery of unacked events, per-document
+ordering, poison-message handling, S3 round-trips and error mapping, the
+full upload → Kafka → S3 → worker → vector store pipeline, and
+cross-client visibility on a real Chroma server.
+
+They are marked `integration` and excluded from the default run, so the
+everyday suite stays hermetic — verified by running it with the containers
+stopped. CI runs them in a second job against
+`docker-compose.test.yml`, which mirrors the prod service definitions on
+offset ports, and validates all three compose files on every push.
 
 ---
 

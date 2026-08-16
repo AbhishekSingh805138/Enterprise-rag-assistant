@@ -38,11 +38,11 @@ def _get_cross_encoder():
                 device = settings.cross_encoder_device
                 _cross_encoder = CrossEncoder(model_name, device=device)
                 logger.info("Cross-encoder model loaded: %s (device=%s)", model_name, device)
-            except ImportError:
+            except ImportError as e:
                 raise ImportError(
                     "sentence-transformers is required for cross-encoder reranking. "
                     "Install with: pip install sentence-transformers>=3.0"
-                )
+                ) from e
         return _cross_encoder
 
 
@@ -92,7 +92,7 @@ class CrossEncoderRetriever(BaseRetriever):
         scores = model.predict(pairs, batch_size=batch_size)
 
         # Pair scores with documents and sort descending
-        scored = list(zip(candidates, scores))
+        scored = list(zip(candidates, scores, strict=True))
         scored.sort(key=lambda x: float(x[1]), reverse=True)
 
         result = [doc for doc, _ in scored[:self.k]]

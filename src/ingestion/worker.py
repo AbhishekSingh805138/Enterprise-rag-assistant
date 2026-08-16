@@ -33,7 +33,6 @@ import time
 from dataclasses import dataclass, field
 
 from config import settings
-
 from src.events.bus import Delivery, Event, EventBus, EventBusError, get_event_bus
 from src.ingestion.pipeline import DocumentParseError, process_document
 from src.ingestion.registry import (

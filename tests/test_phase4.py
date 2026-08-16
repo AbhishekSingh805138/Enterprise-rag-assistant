@@ -25,7 +25,6 @@ from src.graph.nodes import (
 )
 from src.graph.tracing import traced
 
-
 # === Critic node tests ===
 
 class TestCritic:
@@ -193,6 +192,7 @@ class TestTracing:
 class TestGraphWithCritic:
     def test_graph_has_critic_node(self):
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph
 
         graph = build_graph(checkpointer=InMemorySaver())
@@ -201,8 +201,9 @@ class TestGraphWithCritic:
         assert expected.issubset(node_names)
 
     def test_graph_compiles_with_sqlite(self):
-        from src.graph.build_graph import build_graph
         from langgraph.checkpoint.sqlite import SqliteSaver
+
+        from src.graph.build_graph import build_graph
 
         conn = sqlite3.connect(":memory:")
         saver = SqliteSaver(conn)
@@ -225,6 +226,7 @@ class TestGraphIntegration:
     ):
         """Test: retrieve → grade (relevant) → generate → critic → END."""
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph
         from src.graph.nodes import GradeResult
 
@@ -279,6 +281,7 @@ class TestGraphIntegration:
     ):
         """Test: retrieve → grade (not relevant) → rewrite → retrieve → grade (relevant) → generate → critic."""
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph
         from src.graph.nodes import GradeResult
 

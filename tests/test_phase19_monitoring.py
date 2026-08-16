@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Health checker unit tests
 # ---------------------------------------------------------------------------
@@ -55,6 +54,21 @@ class TestHealthChecker:
 
             result = _check_memory()
             assert result.status == "ok"
+
+    @pytest.fixture(autouse=True)
+    def _core_checks_only(self):
+        """Pin async ingestion off for the aggregation tests.
+
+        deep_health_check() adds object-store, queue and registry checks
+        when ASYNC_INGESTION is on. Left unpinned, these tests would both
+        change shape depending on the developer's .env and reach out to
+        those real subsystems. The async variants are covered explicitly
+        in test_phase23_health_checks.py.
+        """
+        with patch("src.observability.health_checker.settings") as mock_settings:
+            mock_settings.async_ingestion = False
+            mock_settings.debug_mode = False
+            yield mock_settings
 
     def test_deep_health_all_ok(self):
         with patch("src.observability.health_checker._check_chromadb") as mock_chroma, \
@@ -122,6 +136,7 @@ class TestDeepHealthEndpoint:
     @pytest.fixture
     def client(self):
         from fastapi.testclient import TestClient
+
         from api.app import app
         return TestClient(app, raise_server_exceptions=False)
 

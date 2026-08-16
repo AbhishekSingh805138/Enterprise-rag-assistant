@@ -105,7 +105,7 @@ class TestAnalyzeQueryNode:
 
     def test_success_multi_part(self):
         """Mocked LLM returns a multi-part analysis; entities fold into query."""
-        from src.graph.analyzer import analyze_query, QueryAnalysis
+        from src.graph.analyzer import QueryAnalysis, analyze_query
 
         analysis = QueryAnalysis(
             intent="comparative",
@@ -134,7 +134,7 @@ class TestAnalyzeQueryNode:
         assert "SLA" in out["transformed_query"]
 
     def test_success_simple_single_sub_question(self):
-        from src.graph.analyzer import analyze_query, QueryAnalysis
+        from src.graph.analyzer import QueryAnalysis, analyze_query
 
         analysis = QueryAnalysis(
             intent="factual",
@@ -155,7 +155,7 @@ class TestAnalyzeQueryNode:
         assert out["sub_questions"] == ["What is the remote work policy?"]
 
     def test_invalid_intent_falls_back_to_heuristic(self):
-        from src.graph.analyzer import analyze_query, QueryAnalysis
+        from src.graph.analyzer import QueryAnalysis, analyze_query
 
         analysis = QueryAnalysis(
             intent="bogus_intent",

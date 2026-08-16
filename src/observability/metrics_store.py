@@ -16,12 +16,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from config import settings
-
 from src.observability.cost_callback import QueryMetrics
 
 logger = logging.getLogger(__name__)
@@ -68,6 +67,11 @@ CREATE TABLE IF NOT EXISTS query_metrics (
 _MIGRATIONS = [
     "ALTER TABLE query_metrics ADD COLUMN is_idk INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE query_metrics ADD COLUMN grader_rejected INTEGER NOT NULL DEFAULT 0",
+    # Which prompt set produced this answer. Without it a drop in answer
+    # quality can be observed but not attributed to the prompt change
+    # that caused it — the measurement and the cause live in different
+    # systems, and correlating them afterwards is guesswork.
+    "ALTER TABLE query_metrics ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''",
 ]
 
 COST_BUDGET = settings.cost_budget_per_query
@@ -100,10 +104,10 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO query_metrics "
                 "(ts, thread_id, question, mode, retriever, prompt_tok, compl_tok, "
-                "total_tok, cost_usd, latency_ms, is_idk, grader_rejected) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "total_tok, cost_usd, latency_ms, is_idk, grader_rejected, prompt_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                     m.thread_id,
                     m.question_preview,
                     m.mode,

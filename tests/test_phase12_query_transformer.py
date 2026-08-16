@@ -358,6 +358,7 @@ class TestGraphWiring:
         _set_setting("parallel_sub_queries", False)
 
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph, reset_graph
 
         reset_graph()
@@ -373,6 +374,7 @@ class TestGraphWiring:
         _set_setting("parallel_sub_queries", False)
 
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph, reset_graph
 
         reset_graph()

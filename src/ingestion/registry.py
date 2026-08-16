@@ -38,7 +38,7 @@ import logging
 import sqlite3
 import threading
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from config import settings
@@ -106,7 +106,7 @@ def derive_document_id(checksum: str, department: str) -> str:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass
@@ -239,7 +239,7 @@ class DocumentRegistry:
             stale_after_s if stale_after_s is not None else settings.ingest_visibility_timeout_s
         )
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_s))
+            datetime.now(UTC) - timedelta(seconds=max(1, stale_s))
         ).isoformat()
         placeholders = ", ".join("?" for _ in _CLAIMABLE)
         with self._lock:
@@ -301,6 +301,23 @@ class DocumentRegistry:
             )
             self._conn.commit()
             return cur.rowcount == 1
+
+    def delete(self, document_id: str) -> bool:
+        """Remove a document's registry row. Returns True if a row was removed.
+
+        Only forgets that the document was ever registered — the stored
+        object and any indexed chunks are untouched, so re-uploading the
+        same file registers it fresh.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM documents WHERE document_id = ?", (document_id,)
+            )
+            self._conn.commit()
+            removed = cur.rowcount == 1
+        if removed:
+            logger.info("Deleted registry row for %s", document_id)
+        return removed
 
     def _update(self, document_id: str, set_clause: str, params: tuple) -> None:
         with self._lock:

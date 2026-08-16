@@ -262,7 +262,7 @@ with st.sidebar:
             _health = _health_resp.json()
             _api_ok = True
             st.markdown(
-                f'<div class="status-badge status-ok">Connected</div>',
+                '<div class="status-badge status-ok">Connected</div>',
                 unsafe_allow_html=True,
             )
             col1, col2 = st.columns(2)

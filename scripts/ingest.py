@@ -55,9 +55,13 @@ def main() -> None:
         print(f"  Split into {len(chunks)} chunk(s)")
 
         added = add_chunks(chunks)
-        print(f"  Persisted {added} new chunk(s) to {settings.chroma_dir}")
 
+        # Report where the chunks actually went: naming the local directory
+        # while connected to a Chroma server would send someone inspecting
+        # the result to a stale copy.
         stats = collection_stats()
+        destination = stats.get("endpoint") or stats.get("persist_directory") or "?"
+        print(f"  Persisted {added} new chunk(s) to {destination}")
         print(f"  Collection total: {stats['document_count']} chunk(s)")
 
     except FileNotFoundError as e:

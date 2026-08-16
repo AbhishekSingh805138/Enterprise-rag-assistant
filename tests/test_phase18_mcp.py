@@ -241,6 +241,7 @@ class TestToolsEndpoint:
     @pytest.fixture
     def client(self):
         from fastapi.testclient import TestClient
+
         from api.app import app
         return TestClient(app, raise_server_exceptions=False)
 

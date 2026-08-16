@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
-
-from config import settings
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

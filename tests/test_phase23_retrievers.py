@@ -245,7 +245,7 @@ class TestComposedLlmRerank:
     def test_returns_top_k_by_llm_score(self, retrieval_settings):
         r = ComposedRetriever(k=2, reranker_type="llm")
         candidates = docs(3)
-        with patch("src.retrieval.composed.ChatOpenAI", return_value=self._llm([1, 9, 5])):
+        with patch("src.retrieval.composed.get_llm", return_value=self._llm([1, 9, 5])):
             result = r._rerank_with_llm("q", candidates)
         assert len(result) == 2
         assert all(d in candidates for d in result)
@@ -258,14 +258,14 @@ class TestComposedLlmRerank:
         llm.with_structured_output.return_value = scorer
 
         r = ComposedRetriever(k=3, reranker_type="llm")
-        with patch("src.retrieval.composed.ChatOpenAI", return_value=llm):
+        with patch("src.retrieval.composed.get_llm", return_value=llm):
             result = r._rerank_with_llm("q", docs(3))
         assert len(result) == 3
 
     def test_all_candidates_are_scored(self, retrieval_settings):
         r = ComposedRetriever(k=2, reranker_type="llm")
         llm = self._llm([5])
-        with patch("src.retrieval.composed.ChatOpenAI", return_value=llm):
+        with patch("src.retrieval.composed.get_llm", return_value=llm):
             r._rerank_with_llm("q", docs(5))
         assert llm.with_structured_output.return_value.invoke.call_count == 5
 

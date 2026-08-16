@@ -12,8 +12,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# Build from the lockfile so an image built today and one built in six
+# months contain byte-identical dependencies. --require-hashes additionally
+# refuses any artifact whose checksum does not match, which is what turns
+# the pin into a supply-chain control rather than just a version record.
+#
+# Regenerate after changing requirements.txt (run inside this same base
+# image so the pins match the target platform):
+#   docker run --rm -v "$PWD:/w" -w /w python:3.11-slim sh -c \
+#     "pip install uv && uv pip compile requirements.txt \
+#      --generate-hashes --output-file requirements.lock"
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir --prefix=/install --require-hashes -r requirements.lock
 
 # Stage 2: Production image
 FROM python:3.11-slim

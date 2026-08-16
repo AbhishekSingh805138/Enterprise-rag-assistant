@@ -329,7 +329,7 @@ enterprise-rag-assistant/
 │   ├── metrics.py             # Metrics dashboard CLI
 │   └── upload_eval_dataset.py # Evaluation dataset uploader
 │
-├── tests/                     # 1130 tests across 48 files (93% coverage)
+├── tests/                     # 1234 tests across 52 files (93% coverage)
 │   ├── conftest.py            # Shared fixtures
 │   └── test_*.py              # Unit, integration, and e2e tests
 │
@@ -919,6 +919,10 @@ Content-Type: application/json
 | `python -m scripts.upload_eval_dataset` | Upload evaluation dataset |
 | `python -m scripts.worker` | Run the ingestion worker (async pipeline) |
 | `python -m scripts.worker --once` | Drain the queue and exit (CI/backfill) |
+| `python -m scripts.migrate_chroma --dry-run` | Preview an embedded → server vector migration |
+| `python -m scripts.migrate_chroma` | Copy the embedded collection into the Chroma server |
+| `python -m scripts.replay_dlq --list` | Show dead-lettered documents and why they failed |
+| `python -m scripts.replay_dlq` | Drain the DLQ and requeue documents for indexing |
 
 ---
 
@@ -942,18 +946,30 @@ upload ─► validate ─► idempotency check ─► object store ─► queue
                                           failure ─► retry ×3 ─► DLQ
 ```
 
+> **Required: `CHROMA_MODE=server`.** The worker indexes in its own
+> process, and embedded ChromaDB caches its index inside the process that
+> opened it — an API using embedded mode will never retrieve a document
+> the worker indexed, until it is restarted. The API warns at startup and
+> reports `degraded` health if you enable async ingestion without it.
+
 ### Running it locally (no broker required)
 
-The defaults are `STORAGE_BACKEND=local` and `EVENT_BUS=sqlite`, a durable
-on-disk queue with visibility timeouts — so retries and dead-lettering behave
-exactly as they do on Kafka, with nothing to install:
+Storage and queueing default to `local` and `sqlite` — a durable on-disk
+queue with visibility timeouts, so retries and dead-lettering behave exactly
+as they do on Kafka, with no broker to install. Only ChromaDB needs to be a
+real server:
 
 ```bash
-# terminal 1
-ASYNC_INGESTION=true uvicorn api.app:app --reload
+# terminal 1 — vector store
+chroma run --path ./chroma_server --port 8001
 
-# terminal 2
-ASYNC_INGESTION=true python -m scripts.worker
+# terminal 2 — API
+ASYNC_INGESTION=true CHROMA_MODE=server CHROMA_PORT=8001 \
+  uvicorn api.app:app --reload
+
+# terminal 3 — worker
+ASYNC_INGESTION=true CHROMA_MODE=server CHROMA_PORT=8001 \
+  python -m scripts.worker
 ```
 
 ```bash
@@ -984,26 +1000,80 @@ Requires the optional extras: `pip install boto3 kafka-python`.
 | Did my upload index? | `GET /documents/{id}` |
 | Backlog / stuck documents | `GET /documents` (per-status counts) |
 | Queue and DLQ depth | `GET /health?deep=true` |
+| What is dead-lettered | `python -m scripts.replay_dlq --list` |
 | Tracing one upload across processes | `JSON_LOGS=true` + the `X-Request-ID` header |
 
+### Recovering dead-lettered documents
+
 A non-zero `DEAD_LETTER` count means documents were accepted from users and
-never indexed. Re-uploading the same file resets its retry budget and
-requeues it.
+never indexed. The bytes are still in object storage, so they can be
+recovered without anyone re-uploading:
+
+```bash
+python -m scripts.replay_dlq --list      # what is stuck, and why
+python -m scripts.replay_dlq --dry-run   # preview; drains nothing
+python -m scripts.replay_dlq             # drain the DLQ and requeue everything
+
+python -m scripts.replay_dlq --document-id doc_abc123   # just one
+curl -X POST http://localhost:8000/documents/doc_abc123/retry
+```
+
+Replay resets the retry budget and publishes a fresh event, so a recovered
+document gets the full retry policy again rather than resuming one attempt
+from exhaustion. It is safe to run repeatedly: already-indexed documents are
+skipped, and a document whose stored object is genuinely gone is reported as
+needing a real re-upload rather than being queued to fail again.
+
+A worker must be running, or replayed documents just sit in `PENDING`.
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `ASYNC_INGESTION` | `false` | Enable the async pipeline |
+| `CHROMA_MODE` | `embedded` | **Set to `server` whenever async ingestion is on** |
 | `STORAGE_BACKEND` | `local` | `local` or `s3` |
 | `EVENT_BUS` | `sqlite` | `sqlite` or `kafka` |
 | `INGEST_MAX_ATTEMPTS` | `3` | Attempts before dead-lettering |
 | `INGEST_VISIBILITY_TIMEOUT_S` | `300` | Redelivery window if a worker dies |
+| `BM25_CACHE_TTL` | `300` | Max age of a sparse index before rebuild |
 | `JSON_LOGS` | `false` | Structured logs with request ids |
+
+### Why a ChromaDB server is required
+
+Embedded ChromaDB keeps its index in the memory of the process that opened
+it, and chromadb's client is a process-level singleton — so a separate
+worker's writes are invisible to the API no matter how the connection is
+recycled. Sparse retrieval has the same shape of problem: the BM25 index is
+an in-memory copy of the corpus, and its invalidation hook only fires in the
+process that did the writing.
+
+Server mode fixes the dense side by making one server authoritative. The
+sparse side is handled by checking the corpus size on each lookup (so an
+indexed document is picked up immediately) with `BM25_CACHE_TTL` as a
+backstop. Both were found by running the app, not by the test suite — see
+ARCHITECTURE.md §2.6.
+
+### Migrating an existing corpus to the server
+
+Switching to server mode leaves anything already indexed in `./chroma_db`
+behind. Copy it across — stored embeddings are reused, so this costs nothing
+in API spend and the vectors are identical:
+
+```bash
+chroma run --path ./chroma_server --port 8001      # target must be running
+
+python -m scripts.migrate_chroma --dry-run          # preview
+python -m scripts.migrate_chroma                    # copy
+```
+
+Chunk IDs are content hashes, so the migration is idempotent — re-running it,
+or running it against a server that already holds some of the same documents,
+adds each chunk exactly once and reports how many were already present.
 
 ---
 
 ## Testing
 
-The project has **1130 tests** across 48 test files covering unit, integration, and end-to-end scenarios, at **93% line coverage**.
+The project has **1234 tests** across 52 test files (1216 unit + 18 integration) covering unit, integration, and end-to-end scenarios, at **93% line coverage**.
 
 ```bash
 # Run all tests
@@ -1069,6 +1139,30 @@ pytest --cov=src --cov=api --cov=config --cov-report=term-missing
 # HTML report
 pytest --cov=src --cov=api --cov=config --cov-report=html && open htmlcov/index.html
 ```
+
+### Integration tests (real Kafka / MinIO / ChromaDB)
+
+The default suite fakes the production backends, which proves call contracts
+but not that a deployment works. The integration suite runs the same code
+against real services and is excluded from the default run:
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+pytest -m integration
+docker compose -f docker-compose.test.yml down -v
+```
+
+It covers Kafka round-trips and offset-commit semantics, redelivery of
+unacked events, per-document ordering, poison-message handling, S3
+round-trips and error mapping, the full upload → Kafka → S3 → worker →
+vector store pipeline, and cross-client visibility on a Chroma server.
+
+`docker-compose.test.yml` mirrors the production backing services on offset
+ports (Kafka 19092, MinIO 19000, Chroma 18001) so it can run alongside a
+local dev stack. CI runs it as a separate job and validates all three
+compose files on every push — worth having: the first run found a withdrawn
+Kafka image, a Chroma client/server version mismatch, and a healthcheck that
+would have deadlocked production startup. See ARCHITECTURE.md §2.8.
 
 ---
 

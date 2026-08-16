@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from config import settings
+from src.prompts import register
 from src.llm_pool import get_llm
 from src.mcp.tool_registry import get_tool_registry
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
@@ -40,7 +41,6 @@ def mcp_route_and_invoke(question: str) -> list[str]:
     # Ask the LLM which tools to use
     try:
         from langchain_core.prompts import ChatPromptTemplate
-        from langchain_core.output_parsers import StrOutputParser
         from pydantic import BaseModel, Field
 
         class ToolSelection(BaseModel):
@@ -48,7 +48,10 @@ def mcp_route_and_invoke(question: str) -> list[str]:
             tool_name: str = Field(description="Name of the tool to use, or 'none' if no tool is needed")
             arguments: dict = Field(default_factory=dict, description="Arguments to pass to the tool")
 
-        prompt = ChatPromptTemplate.from_messages([
+        prompt = register(
+            "mcp_tool_selection",
+            "v1",
+            [
             ("system",
              "You are a tool selection assistant. Given a user question and "
              "available tools, decide if any tool should be used.\n\n"

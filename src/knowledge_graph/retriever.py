@@ -6,7 +6,6 @@ traverses neighbors, and returns source documents as context.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document

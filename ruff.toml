@@ -1,0 +1,70 @@
+# Lint configuration.
+#
+# The rule set is chosen to catch real defects without fighting two
+# deliberate patterns in this codebase:
+#
+#   * Broad `except Exception` around best-effort work (metrics, cache
+#     writes, connection close). Failing a query because a metrics insert
+#     failed would be worse than the swallow, so these are intentional.
+#   * Long prompts written as adjacent string literals inside tuples,
+#     which is the readable way to author them.
+#
+# Enforcing those would produce ~50 findings that all resolve to "the code
+# is right", which trains people to ignore the linter.
+
+target-version = "py311"
+line-length = 110
+extend-exclude = ["chroma_db", "chroma_server", "object_store", "checkpoints"]
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes — undefined names, unused imports
+    "I",      # import ordering
+    "UP",     # pyupgrade — outdated syntax
+    "B",      # bugbear — likely bugs
+    "SIM",    # simplification
+    "RUF",    # ruff-specific
+]
+
+ignore = [
+    "E501",    # line length; enforced loosely via line-length, not as an error
+    "B008",    # function call in default arg — this is how FastAPI Depends/Form work
+    "SIM105",  # contextlib.suppress over try/except/pass; the explicit form reads better here
+    "ISC001",  # conflicts with formatter-style string concatenation
+
+    # Rewrites that trade readability for terseness. Kept off deliberately:
+    # a gate that fires on these teaches people to skim past it, which is
+    # how the genuinely useful findings (F, B905, I) get ignored too.
+    "RUF005",  # [*a, b] over a + [b]
+    "RUF015",  # next(iter(x)) over list(x)[0]
+    "SIM102",  # collapse nested if — often clearer nested when guards differ in intent
+    "SIM108",  # ternary over if/else block
+    "SIM103",  # return the condition directly
+    "RUF012",  # ClassVar annotation on mutable class attributes
+    "B007",    # unused loop variable
+]
+
+[lint.per-file-ignores]
+# Tests deliberately reach into private attributes, re-import inside
+# functions to control patch ordering, stack `with patch(...)` blocks for
+# readability, assert on broad exceptions, and bind values they do not
+# assert on. Enforcing style here would not find defects.
+"tests/**" = [
+    "SLF001",  # private member access — deliberate, tests probe internals
+    "F401",    # imports pulled in for patch targets
+    "E402",    # imports after fixtures, to control import order
+    "B011",    # assert False
+    "B017",    # pytest.raises(Exception) — sometimes the point of the test
+    "F841",    # bound-but-unasserted values in arrange blocks
+    "RUF059",  # unpacked-but-unused fixture tuples
+    "SIM117",  # stacked with-blocks read better than one long line
+]
+# Re-export surfaces.
+"src/*/__init__.py" = ["F401"]
+# Small lambda adapters (answer_fn) are clearer inline than as defs.
+"api/app.py" = ["E731"]
+"src/eval/ragas_eval.py" = ["E731"]
+
+[lint.isort]
+known-first-party = ["src", "api", "config", "scripts"]

@@ -15,6 +15,8 @@ import hashlib
 import logging
 import re
 import threading
+import time
+from dataclasses import dataclass
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
@@ -23,6 +25,7 @@ from pydantic import Field, PrivateAttr
 from rank_bm25 import BM25Okapi
 
 from config import settings
+from src.security.access_control import matches_filter
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +48,25 @@ _STOP_WORDS = frozenset({
     "that", "these", "those", "am",
 })
 
-# Module-level BM25 cache: filter_hash -> (BM25Okapi, list[Document])
-_bm25_cache: dict[str, tuple[BM25Okapi, list[Document]]] = {}
+@dataclass
+class _CachedIndex:
+    """A built BM25 index plus what it was built from.
+
+    *source_count* is the size of the whole collection at build time (not
+    of the filtered corpus), which is what makes cross-process staleness
+    detectable: the ingestion worker's reset_bm25_cache() only clears its
+    own process, so a long-lived API server would otherwise serve a
+    sparse index that predates every uploaded document.
+    """
+
+    bm25: BM25Okapi
+    docs: list[Document]
+    built_at: float
+    source_count: int
+
+
+# Module-level BM25 cache: filter_hash -> _CachedIndex
+_bm25_cache: dict[str, _CachedIndex] = {}
 _bm25_lock = threading.Lock()
 
 
@@ -63,6 +83,38 @@ def reset_bm25_cache() -> None:
     logger.debug("BM25 cache cleared")
 
 
+def _collection_count() -> int:
+    """Current document count, or -1 when it cannot be read."""
+    try:
+        from src.vectorstore.chroma_store import get_vectorstore
+
+        return get_vectorstore()._collection.count()
+    except Exception:
+        logger.debug("Could not read collection count for BM25 staleness check", exc_info=True)
+        return -1
+
+
+def _is_stale(entry: _CachedIndex) -> bool:
+    """Whether *entry* must be rebuilt before it is served.
+
+    Two independent signals: the corpus size changed (catches almost
+    every add or delete immediately, at the cost of one cheap count call
+    per lookup), or the entry simply aged out (backstop for an add and a
+    delete that happen to cancel out).
+    """
+    if time.monotonic() - entry.built_at > settings.bm25_cache_ttl:
+        logger.info("BM25 index aged out after %ds — rebuilding", settings.bm25_cache_ttl)
+        return True
+    count = _collection_count()
+    if count >= 0 and count != entry.source_count:
+        logger.info(
+            "Collection changed (%d -> %d documents) — rebuilding BM25 index",
+            entry.source_count, count,
+        )
+        return True
+    return False
+
+
 class HybridRetriever(BaseRetriever):
     """Fuses dense (ChromaDB) and sparse (BM25) retrieval via RRF."""
 
@@ -75,11 +127,19 @@ class HybridRetriever(BaseRetriever):
 
     @staticmethod
     def _filter_cache_key(filter: dict | None) -> str:
-        """Produce a stable cache key from the metadata filter."""
+        """Produce a stable cache key from the metadata filter.
+
+        Serialised with sorted keys because filter values are no longer
+        always scalars — a department-scoped caller retrieves with
+        ``{"department": {"$in": [...]}}``, and two equivalent filters
+        must not land on two cache entries (or, worse, one filter reuse
+        another's corpus).
+        """
         if not filter:
             return "__no_filter__"
-        parts = sorted(f"{k}={v}" for k, v in filter.items())
-        return "|".join(parts)
+        import json
+
+        return json.dumps(filter, sort_keys=True, default=str)
 
     def _build_bm25_index(self) -> None:
         """Load all documents from ChromaDB and build a BM25 index.
@@ -91,10 +151,11 @@ class HybridRetriever(BaseRetriever):
 
         # Check module-level cache first (thread-safe)
         with _bm25_lock:
-            if cache_key in _bm25_cache:
-                self._bm25, self._corpus_docs = _bm25_cache[cache_key]
-                logger.debug("BM25 cache hit for key=%s (%d docs)", cache_key, len(self._corpus_docs))
-                return
+            cached = _bm25_cache.get(cache_key)
+        if cached is not None and not _is_stale(cached):
+            self._bm25, self._corpus_docs = cached.bm25, cached.docs
+            logger.debug("BM25 cache hit for key=%s (%d docs)", cache_key, len(self._corpus_docs))
+            return
 
         from src.vectorstore.chroma_store import get_vectorstore
 
@@ -119,12 +180,15 @@ class HybridRetriever(BaseRetriever):
             self._bm25 = None
             return
 
-        # Apply metadata filter if specified
+        # Apply metadata filter if specified. matches_filter understands
+        # the same operator forms Chroma does ($in, $ne, ...) — plain
+        # equality here would match nothing for a department-scoped
+        # caller, silently costing them sparse retrieval while dense
+        # retrieval carried on working.
         self._corpus_docs = []
-        for doc_id, text, meta in zip(ids, texts, metadatas):
-            if self.filter:
-                if not all(meta.get(fk) == fv for fk, fv in self.filter.items()):
-                    continue
+        for doc_id, text, meta in zip(ids, texts, metadatas, strict=True):
+            if not matches_filter(meta or {}, self.filter):
+                continue
             self._corpus_docs.append(
                 Document(page_content=text, metadata=meta or {})
             )
@@ -135,12 +199,31 @@ class HybridRetriever(BaseRetriever):
             return
 
         tokenized = [_tokenize(d.page_content) for d in self._corpus_docs]
+        if not any(tokenized):
+            # Every document tokenized to nothing (all stop-words, single
+            # characters, or punctuation). BM25Okapi divides by the size of
+            # the idf table when that happens, so building here would raise
+            # and take hybrid retrieval down; fall back to dense-only.
+            logger.warning(
+                "No indexable terms in %d document(s) — skipping BM25 index",
+                len(self._corpus_docs),
+            )
+            self._bm25 = None
+            return
+
         self._bm25 = BM25Okapi(tokenized)
         logger.info("BM25 index built: %d documents", len(self._corpus_docs))
 
-        # Store in module-level cache (thread-safe)
+        # Store in module-level cache (thread-safe). source_count is the
+        # whole collection, not the filtered corpus, so the staleness
+        # check works the same for filtered and unfiltered indexes.
         with _bm25_lock:
-            _bm25_cache[cache_key] = (self._bm25, self._corpus_docs)
+            _bm25_cache[cache_key] = _CachedIndex(
+                bm25=self._bm25,
+                docs=self._corpus_docs,
+                built_at=time.monotonic(),
+                source_count=len(ids),
+            )
 
     def _get_bm25_results(self, query: str, n: int) -> list[tuple[Document, float]]:
         """Return top-n BM25 results as (doc, score) pairs."""

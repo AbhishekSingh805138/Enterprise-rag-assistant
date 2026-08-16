@@ -7,7 +7,7 @@ as one document rather than two.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,6 +33,13 @@ def store_settings():
         s.chroma_refresh_interval = 300
         s.top_k = 4
         s.document_ttl_days = 0
+        # Explicit: an unset MagicMock attribute is truthy, which would
+        # route these tests into server mode / token auth.
+        s.chroma_mode = "embedded"
+        s.chroma_host = "localhost"
+        s.chroma_port = 8001
+        s.chroma_ssl = False
+        s.chroma_auth_token = ""
         yield s
 
 
@@ -44,7 +51,7 @@ def fake_chroma(store_settings):
     instance._collection.count.return_value = 7
     with (
         patch("src.vectorstore.chroma_store.Chroma", return_value=instance) as klass,
-        patch("src.vectorstore.chroma_store.OpenAIEmbeddings") as emb,
+        patch("src.vectorstore.chroma_store.build_embeddings") as emb,
     ):
         yield instance, klass, emb
 
@@ -224,7 +231,7 @@ class TestGetRetriever:
 
 class TestStaleDocuments:
     def _dated(self, days_ago):
-        return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
 
     def test_ttl_disabled_returns_nothing(self, fake_chroma, store_settings):
         store_settings.document_ttl_days = 0
@@ -300,9 +307,35 @@ class TestCollectionStats:
         stats = cs.collection_stats()
         assert stats == {
             "collection": "test_docs",
+            "mode": "embedded",
             "persist_directory": "./test_chroma",
+            "endpoint": "",
             "document_count": 7,
         }
+
+    def test_server_mode_reports_the_endpoint_not_a_directory(
+        self, fake_chroma, store_settings
+    ):
+        """Pointing an operator at a local directory that isn't in use is worse
+        than reporting nothing."""
+        store_settings.chroma_mode = "server"
+        store_settings.chroma_host = "chroma"
+        store_settings.chroma_port = 8000
+        store_settings.chroma_ssl = False
+        with patch("chromadb.HttpClient", return_value=MagicMock()):
+            stats = cs.collection_stats()
+        assert stats["mode"] == "server"
+        assert stats["endpoint"] == "http://chroma:8000"
+        assert stats["persist_directory"] == ""
+
+    def test_ssl_is_reflected_in_the_endpoint(self, fake_chroma, store_settings):
+        store_settings.chroma_mode = "server"
+        store_settings.chroma_host = "vectors.internal"
+        store_settings.chroma_port = 443
+        store_settings.chroma_ssl = True
+        with patch("chromadb.HttpClient", return_value=MagicMock()):
+            stats = cs.collection_stats()
+        assert stats["endpoint"] == "https://vectors.internal:443"
 
     def test_count_failure_reports_minus_one(self, fake_chroma):
         instance, _klass, _emb = fake_chroma

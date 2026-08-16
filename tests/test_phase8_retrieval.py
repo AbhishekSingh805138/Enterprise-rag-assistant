@@ -18,7 +18,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # ---------------------------------------------------------------------------
 # TestBM25Tokenization
 # ---------------------------------------------------------------------------
@@ -92,11 +91,32 @@ class TestBM25Cache:
         assert HybridRetriever._filter_cache_key(None) == "__no_filter__"
 
     def test_filter_cache_key_with_filter(self):
+        """Every field must reach the key, whatever the encoding.
+
+        Asserts the contract (each field and value is represented) rather
+        than one serialisation, so the key format can change without a
+        false failure — as it did when department scoping introduced
+        ``{"$in": [...]}`` values that the old ``k=v`` form could not
+        encode unambiguously.
+        """
         from src.retrieval.hybrid import HybridRetriever
         key = HybridRetriever._filter_cache_key({"department": "hr", "access_level": "internal"})
-        # Should be sorted and deterministic
-        assert "access_level=internal" in key
-        assert "department=hr" in key
+        for token in ("access_level", "internal", "department", "hr"):
+            assert token in key
+
+    def test_filter_cache_key_distinguishes_departments(self):
+        """Two scopes must not collide onto one cached corpus."""
+        from src.retrieval.hybrid import HybridRetriever
+        hr_only = HybridRetriever._filter_cache_key({"department": "hr"})
+        legal_only = HybridRetriever._filter_cache_key({"department": "legal"})
+        scoped = HybridRetriever._filter_cache_key({"department": {"$in": ["general", "hr"]}})
+        assert len({hr_only, legal_only, scoped}) == 3
+
+    def test_filter_cache_key_stable_for_operator_filters(self):
+        from src.retrieval.hybrid import HybridRetriever
+        k1 = HybridRetriever._filter_cache_key({"department": {"$in": ["general", "hr"]}})
+        k2 = HybridRetriever._filter_cache_key({"department": {"$in": ["general", "hr"]}})
+        assert k1 == k2
 
     def test_filter_cache_key_deterministic(self):
         from src.retrieval.hybrid import HybridRetriever
@@ -347,8 +367,8 @@ class TestFactory:
     def test_hybrid_rerank_returns_composed_retriever(self):
         with patch("src.retrieval.composed.ComposedRetriever") as MockComposed:
             MockComposed.return_value = MagicMock()
-            from src.retrieval.factory import get_retriever
             from src.retrieval.composed import ComposedRetriever
+            from src.retrieval.factory import get_retriever
             retriever = get_retriever("hybrid_rerank")
             # Should return a ComposedRetriever instance
             assert retriever is not None

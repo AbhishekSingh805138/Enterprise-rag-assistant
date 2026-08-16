@@ -20,7 +20,6 @@ import threading
 import time
 
 from config import settings
-
 from src.events.bus import Event, EventBusError
 
 logger = logging.getLogger(__name__)
@@ -32,7 +31,7 @@ _MAX_INLINE_DELAY_S = 30.0
 
 def _require_kafka():
     try:
-        import kafka  # noqa: F401
+        import kafka
 
         return kafka
     except ImportError as e:  # pragma: no cover - depends on env
@@ -45,7 +44,7 @@ def _require_kafka():
 class KafkaDelivery:
     """A consumed record; ack commits its offset, nack leaves it uncommitted."""
 
-    def __init__(self, bus: "KafkaEventBus", record, event: Event) -> None:
+    def __init__(self, bus: KafkaEventBus, record, event: Event) -> None:
         self._bus = bus
         self._record = record
         self.event = event

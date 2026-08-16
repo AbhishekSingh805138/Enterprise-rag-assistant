@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from config import settings
@@ -49,7 +49,7 @@ class ConversationStore:
             self._conn.execute(
                 "INSERT INTO conversation_history (session_id, role, content, created_at) "
                 "VALUES (?, ?, ?, ?)",
-                (session_id, role, content, datetime.now(timezone.utc).isoformat()),
+                (session_id, role, content, datetime.now(UTC).isoformat()),
             )
             self._conn.commit()
 

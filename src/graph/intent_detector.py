@@ -20,6 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
@@ -47,7 +48,10 @@ class IntentResult(BaseModel):
     )
 
 
-_intent_prompt = ChatPromptTemplate.from_messages(
+_intent_prompt = register(
+    "intent_detection",
+    "v1",
+
     [
         (
             "system",

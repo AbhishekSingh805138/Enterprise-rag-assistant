@@ -17,6 +17,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # chroma_db is only used in embedded mode (the default, sync ingestion).
+      # Under --profile async the api talks to the chroma service instead.
       - ./chroma_db:/app/chroma_db
       - ./checkpoints:/app/checkpoints
       - ./object_store:/app/object_store
@@ -33,7 +35,6 @@ services:
     command: python -m scripts.worker
     profiles: ["async"]
     volumes:
-      - ./chroma_db:/app/chroma_db
       - ./checkpoints:/app/checkpoints
       - ./object_store:/app/object_store
     env_file: .env
@@ -45,10 +46,29 @@ services:
       - EVENT_BUS_PATH=/app/checkpoints/event_bus.db
       - STORAGE_BACKEND=local
       - STORAGE_LOCAL_DIR=/app/object_store
+      # Required whenever the worker is a separate process from the API.
+      - CHROMA_MODE=server
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
     depends_on:
       api:
         condition: service_started
+      chroma:
+        condition: service_started
     stop_grace_period: 60s
+
+  # Only needed for the async profile; embedded ChromaDB cannot be shared
+  # between the API and the worker.
+  chroma:
+    image: chromadb/chroma:1.5.9
+    profiles: ["async"]
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./chroma_server:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
 
   ui:
     build: .

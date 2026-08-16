@@ -5,8 +5,6 @@ documents are most relevant to a query. Returns None when ambiguous.
 """
 from __future__ import annotations
 
-import re
-
 # Department -> keyword patterns (case-insensitive).
 # Each pattern is a tuple of (keyword, weight). Higher weight = stronger signal.
 _DEPT_KEYWORDS: dict[str, list[tuple[str, float]]] = {

@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -48,7 +47,7 @@ class TestMetricsStoreSingleton:
     """Concurrent calls to get_store() must return the same instance."""
 
     def test_concurrent_get_store_returns_same_instance(self, tmp_path):
-        from src.observability.metrics_store import get_store, reset_store, _store_lock
+        from src.observability.metrics_store import _store_lock, get_store, reset_store
 
         db_path = str(tmp_path / "metrics.db")
         reset_store()
@@ -198,7 +197,7 @@ class TestBM25CacheThreadSafety:
     """Concurrent BM25 cache access must not corrupt shared state."""
 
     def test_concurrent_reset_no_error(self):
-        from src.retrieval.hybrid import reset_bm25_cache, _bm25_cache
+        from src.retrieval.hybrid import _bm25_cache, reset_bm25_cache
 
         # Just verify concurrent resets don't raise
         _run_concurrent(reset_bm25_cache)
@@ -213,7 +212,7 @@ class TestNodeMetricsThreadSafety:
     """Concurrent metric recording must not lose data."""
 
     def test_concurrent_metric_append(self):
-        from src.graph.tracing import _node_metrics, _lock, reset_node_metrics
+        from src.graph.tracing import _lock, _node_metrics, reset_node_metrics
 
         reset_node_metrics()
         total = NUM_THREADS * ITERATIONS_PER_THREAD
@@ -229,7 +228,7 @@ class TestNodeMetricsThreadSafety:
 
     def test_concurrent_reset_and_append(self):
         """Interleaved reset and append must not raise."""
-        from src.graph.tracing import _node_metrics, _lock, reset_node_metrics
+        from src.graph.tracing import _lock, _node_metrics, reset_node_metrics
 
         reset_node_metrics()
         errors = []
@@ -297,14 +296,58 @@ class TestVectorstoreSingletonThreadSafety:
     def test_concurrent_get_vectorstore_returns_same_instance(
         self, mock_embed, mock_chroma
     ):
+        """Embedded mode: concurrent callers share one store.
+
+        The mode is pinned rather than inherited from the environment. In
+        server mode get_vectorstore() opens an HTTP client eagerly, so a
+        developer whose .env points at a Chroma server would otherwise see
+        this locking test fail on connectivity — testing the wrong thing.
+        """
         from src.vectorstore.chroma_store import get_vectorstore, reset_store
 
         fake_store = MagicMock()
         mock_chroma.return_value = fake_store
+
+        with patch("src.vectorstore.chroma_store.settings") as s:
+            s.chroma_mode = "embedded"
+            s.chroma_collection = "test_docs"
+            s.chroma_dir = "./test_chroma"
+            s.chroma_refresh_interval = 300
+            reset_store()
+
+            instances = _run_concurrent(get_vectorstore)
+            assert len({id(i) for i in instances}) == 1
+            # Chroma constructor called exactly once
+            assert mock_chroma.call_count == 1
         reset_store()
 
-        instances = _run_concurrent(get_vectorstore)
-        assert len(set(id(i) for i in instances)) == 1
-        # Chroma constructor called exactly once
-        assert mock_chroma.call_count == 1
+    @patch("src.vectorstore.chroma_store.Chroma")
+    @patch("src.vectorstore.chroma_store._get_embeddings")
+    def test_concurrent_get_vectorstore_in_server_mode(self, mock_embed, mock_chroma):
+        """Server mode is the production path, so its locking matters too.
+
+        It also must not reconnect per call: the client is never recycled
+        on the refresh interval because the server is authoritative.
+        """
+        from src.vectorstore.chroma_store import get_vectorstore, reset_store
+
+        mock_chroma.return_value = MagicMock()
+
+        with (
+            patch("src.vectorstore.chroma_store.settings") as s,
+            patch("chromadb.HttpClient", return_value=MagicMock()) as http,
+        ):
+            s.chroma_mode = "server"
+            s.chroma_host = "chroma"
+            s.chroma_port = 8000
+            s.chroma_ssl = False
+            s.chroma_auth_token = ""
+            s.chroma_collection = "test_docs"
+            s.chroma_refresh_interval = 0  # would recycle in embedded mode
+            reset_store()
+
+            instances = _run_concurrent(get_vectorstore)
+            assert len({id(i) for i in instances}) == 1
+            assert mock_chroma.call_count == 1
+            assert http.call_count == 1  # one connection, not one per caller
         reset_store()

@@ -17,43 +17,77 @@ import hashlib
 import logging
 import threading
 import time
+from datetime import UTC
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStoreRetriever
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.embeddings import Embeddings
 
 from config import settings
+from src.llm.providers import build_embeddings, embedding_fingerprint
 
 logger = logging.getLogger(__name__)
 
 # Module-level singletons — avoids recreating clients on every call.
-_embeddings: OpenAIEmbeddings | None = None
+_embeddings: Embeddings | None = None
 _vectorstore: Chroma | None = None
 _last_refresh: float = 0.0  # monotonic timestamp of last refresh
 _lock = threading.Lock()
 
 
-def _get_embeddings() -> OpenAIEmbeddings:
+def _get_embeddings() -> Embeddings:
     global _embeddings
     if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(
-            model=settings.embedding_model,
-            api_key=settings.openai_api_key,
+        _embeddings = build_embeddings(
+            settings.embedding_provider, settings.embedding_model
         )
     return _embeddings
 
 
-def get_vectorstore() -> Chroma:
-    """Open (or create) the persistent collection (singleton).
+def _build_http_client():
+    """Connect to a ChromaDB server (CHROMA_MODE=server).
 
-    Automatically refreshes the connection if CHROMA_REFRESH_INTERVAL has
-    elapsed since last open/refresh. Thread-safe via module lock.
+    Every read goes to the server, so a document indexed by the ingestion
+    worker is immediately visible here — which is the whole reason this
+    mode exists.
+    """
+    import chromadb
+
+    kwargs: dict = {
+        "host": settings.chroma_host,
+        "port": settings.chroma_port,
+        "ssl": settings.chroma_ssl,
+    }
+    if settings.chroma_auth_token:
+        from chromadb.config import Settings as ChromaSettings
+
+        kwargs["settings"] = ChromaSettings(
+            chroma_client_auth_provider="chromadb.auth.token_authn.TokenAuthClientProvider",
+            chroma_client_auth_credentials=settings.chroma_auth_token,
+        )
+    return chromadb.HttpClient(**kwargs)
+
+
+def get_vectorstore() -> Chroma:
+    """Open (or create) the collection (singleton). Thread-safe via module lock.
+
+    In *server* mode the client is a thin HTTP handle and is never
+    recycled — the server is the single source of truth, so there is
+    nothing stale to refresh.
+
+    In *embedded* mode the periodic recycle below is retained, but note
+    what it does **not** do: chromadb's PersistentClient is a
+    process-level singleton keyed by path, so discarding this wrapper
+    reuses the same in-memory index and will not pick up writes made by
+    another process. Embedded mode is single-process only.
     """
     global _vectorstore, _last_refresh
     with _lock:
         now = time.monotonic()
-        if _vectorstore is not None:
+        server_mode = settings.chroma_mode.lower() == "server"
+
+        if _vectorstore is not None and not server_mode:
             elapsed = now - _last_refresh
             if elapsed > settings.chroma_refresh_interval:
                 logger.info(
@@ -63,17 +97,92 @@ def get_vectorstore() -> Chroma:
                 _vectorstore = None  # force re-creation
 
         if _vectorstore is None:
-            _vectorstore = Chroma(
-                collection_name=settings.chroma_collection,
-                embedding_function=_get_embeddings(),
-                persist_directory=settings.chroma_dir,
-            )
+            if server_mode:
+                _vectorstore = Chroma(
+                    collection_name=settings.chroma_collection,
+                    embedding_function=_get_embeddings(),
+                    client=_build_http_client(),
+                )
+                logger.info(
+                    "Connected to Chroma server %s:%d (collection '%s')",
+                    settings.chroma_host, settings.chroma_port,
+                    settings.chroma_collection,
+                )
+            else:
+                _vectorstore = Chroma(
+                    collection_name=settings.chroma_collection,
+                    embedding_function=_get_embeddings(),
+                    persist_directory=settings.chroma_dir,
+                )
+                logger.info(
+                    "Opened embedded Chroma collection '%s' at %s",
+                    settings.chroma_collection, settings.chroma_dir,
+                )
             _last_refresh = now
-            logger.info(
-                "Opened Chroma collection '%s' at %s",
-                settings.chroma_collection, settings.chroma_dir,
-            )
+            _assert_embedding_space(_vectorstore)
         return _vectorstore
+
+
+_EMBEDDING_KEY = "embedding_fingerprint"
+
+
+class EmbeddingSpaceMismatch(RuntimeError):
+    """The collection was built with a different embedding model."""
+
+
+def _assert_embedding_space(store: Chroma) -> None:
+    """Refuse to serve a collection embedded by a different model.
+
+    Vectors from two embedding models are not comparable. Querying an
+    index built by one using another does not error — it returns
+    confidently ranked, semantically unrelated documents, which the RAG
+    pipeline then cites as sources. There is no failure signal anywhere
+    downstream, so this is checked at the only point where it is cheap.
+
+    Stamps the fingerprint on first use so existing collections adopt it
+    rather than needing a migration.
+    """
+    current = embedding_fingerprint()
+    try:
+        collection = store._collection
+        metadata = collection.metadata
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        recorded = metadata.get(_EMBEDDING_KEY)
+
+        # Only a string is a fingerprint. Anything else means the store
+        # did not give us one, and guessing from it would be worse than
+        # not checking at all.
+        if isinstance(recorded, str) and recorded:
+            if recorded != current:
+                raise EmbeddingSpaceMismatch(
+                    f"Collection '{settings.chroma_collection}' was indexed with "
+                    f"embedding model '{recorded}' but this process is configured "
+                    f"for '{current}'. Vectors from different embedding models are "
+                    f"not comparable — retrieval would return plausible-looking "
+                    f"but unrelated documents. Re-index the corpus, or set "
+                    f"EMBEDDING_MODEL/EMBEDDING_PROVIDER back to '{recorded}'."
+                )
+            return
+
+        count = collection.count()
+        if not isinstance(count, int):
+            return  # not a real collection handle; nothing to stamp
+        collection.modify(metadata={**metadata, _EMBEDDING_KEY: current})
+        if count > 0:
+            # A corpus indexed before this check existed. Adopt the
+            # current model as its identity rather than guessing, and say
+            # so — this is the one moment a genuine mismatch can pass
+            # through unnoticed.
+            logger.warning(
+                "Collection '%s' had no embedding fingerprint; adopting '%s'. "
+                "If it was indexed with a different model, re-index it.",
+                settings.chroma_collection, current,
+            )
+    except EmbeddingSpaceMismatch:
+        raise
+    except Exception as e:
+        # Never let the guard itself take down retrieval.
+        logger.debug("Could not verify embedding fingerprint: %s", e)
 
 
 def refresh_store() -> None:
@@ -134,7 +243,7 @@ def add_chunks(chunks: list[Document]) -> int:
 
     new_chunks = []
     new_ids = []
-    for chunk, cid in zip(chunks, ids):
+    for chunk, cid in zip(chunks, ids, strict=True):
         if cid not in existing:
             new_chunks.append(chunk)
             new_ids.append(cid)
@@ -191,13 +300,13 @@ def get_stale_documents(max_age_days: int | None = None) -> list[str]:
     Requires documents to have 'ingested_at' ISO-format metadata.
     Returns an empty list if TTL is disabled (max_age_days=0).
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     days = max_age_days if max_age_days is not None else settings.document_ttl_days
     if days <= 0:
         return []
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(UTC) - timedelta(days=days)
     store = get_vectorstore()
     stale_ids: list[str] = []
 
@@ -206,7 +315,7 @@ def get_stale_documents(max_age_days: int | None = None) -> list[str]:
         if not result or not result.get("ids"):
             return []
 
-        for doc_id, meta in zip(result["ids"], result["metadatas"]):
+        for doc_id, meta in zip(result["ids"], result["metadatas"], strict=True):
             ingested_at = meta.get("ingested_at", "")
             if not ingested_at:
                 continue
@@ -248,14 +357,27 @@ def delete_stale_documents(max_age_days: int | None = None) -> int:
 
 
 def collection_stats() -> dict:
-    """Return basic stats about the current collection."""
+    """Return basic stats about the current collection.
+
+    Reports where the vectors actually live: a directory in embedded mode,
+    an endpoint in server mode. Reporting a persist_directory while
+    connected to a server would point operators at a stale local copy.
+    """
     store = get_vectorstore()
     try:
         count = store._collection.count()
     except Exception:
         count = -1
+
+    server_mode = settings.chroma_mode.lower() == "server"
+    scheme = "https" if settings.chroma_ssl else "http"
     return {
         "collection": settings.chroma_collection,
-        "persist_directory": settings.chroma_dir,
+        "mode": "server" if server_mode else "embedded",
+        "persist_directory": "" if server_mode else settings.chroma_dir,
+        "endpoint": (
+            f"{scheme}://{settings.chroma_host}:{settings.chroma_port}"
+            if server_mode else ""
+        ),
         "document_count": count,
     }

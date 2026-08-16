@@ -16,10 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = settings.max_retries
 
 
-def _llm(temperature: float = 0) -> ChatOpenAI:
+def _llm(temperature: float = 0) -> Runnable:
     """Return a cached LLM instance from the pool."""
     return get_llm(temperature=temperature)
 
@@ -105,7 +106,10 @@ class GradeResult(BaseModel):
     )
 
 
-_grade_prompt = ChatPromptTemplate.from_messages(
+_grade_prompt = register(
+    "grade_documents",
+    "v1",
+
     [
         (
             "system",
@@ -121,7 +125,10 @@ _grade_prompt = ChatPromptTemplate.from_messages(
 )
 
 
-_per_doc_grade_prompt = ChatPromptTemplate.from_messages(
+_per_doc_grade_prompt = register(
+    "grade_document_single",
+    "v1",
+
     [
         (
             "system",
@@ -229,7 +236,10 @@ def grade_documents(state: dict) -> dict:
 
 # --- Node: transform query (corrective step) -------------------------------
 
-_rewrite_prompt = ChatPromptTemplate.from_messages(
+_rewrite_prompt = register(
+    "rewrite_query",
+    "v1",
+
     [
         (
             "system",
@@ -386,9 +396,15 @@ def _build_gen_prompt(*, has_memory: bool = False) -> ChatPromptTemplate:
     if has_memory:
         system += _GEN_MEMORY_ADDENDUM
     system += "\n\nContext:\n{context}"
-    return ChatPromptTemplate.from_messages(
-        [("system", system), ("human", "{question}")]
-    )
+    # Registered under a name that reflects the variant, because the
+    # assembled text differs by flag — recording only "generate" would
+    # attribute two different prompts to one identity.
+    variant = "generate"
+    if settings.chain_of_thought:
+        variant += "_cot"
+    if has_memory:
+        variant += "_memory"
+    return register(variant, "v1", [("system", system), ("human", "{question}")])
 
 
 _gen_prompt = _build_gen_prompt()
@@ -459,7 +475,10 @@ class ClaimVerdict(BaseModel):
     )
 
 
-_critic_prompt = ChatPromptTemplate.from_messages(
+_critic_prompt = register(
+    "critic_verify",
+    "v1",
+
     [
         (
             "system",
@@ -490,7 +509,10 @@ _critic_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-_rewrite_prompt_critic = ChatPromptTemplate.from_messages(
+_rewrite_prompt_critic = register(
+    "critic_rewrite_answer",
+    "v1",
+
     [
         (
             "system",

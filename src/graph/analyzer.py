@@ -24,6 +24,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.prompts import register
 from src.graph.intent_detector import VALID_INTENTS, _heuristic_intent
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
@@ -79,7 +80,10 @@ class QueryAnalysis(BaseModel):
     )
 
 
-_analysis_prompt = ChatPromptTemplate.from_messages(
+_analysis_prompt = register(
+    "unified_analysis",
+    "v1",
+
     [
         (
             "system",

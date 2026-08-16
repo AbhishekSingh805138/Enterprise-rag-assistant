@@ -22,8 +22,8 @@ def load_memory(state: dict) -> dict:
         return {"chat_history": [], "memory_context": ""}
 
     try:
-        from src.memory.conversation_store import get_conversation_store
         from src.memory.context_builder import build_memory_context
+        from src.memory.conversation_store import get_conversation_store
 
         store = get_conversation_store()
         history = store.get_history(session_id)

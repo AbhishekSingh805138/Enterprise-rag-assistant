@@ -14,7 +14,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # ---------------------------------------------------------------------------
 # TestScopeDetection
 # ---------------------------------------------------------------------------
@@ -156,6 +155,7 @@ class TestGraphStructure:
 
     def test_graph_has_scope_check_node(self):
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph, reset_graph
 
         reset_graph()

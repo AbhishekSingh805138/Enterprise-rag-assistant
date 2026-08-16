@@ -11,7 +11,10 @@ langgraph>=1.0,<2.0
 langgraph-checkpoint-sqlite>=2.0
 
 # Vector store
-chromadb>=0.5
+# Keep this major in step with the chromadb/chroma image tag in the compose
+# files. A 1.x client against a 0.6.x server fails on the v2 API with an
+# opaque KeyError('_type') — pin both together.
+chromadb>=1.5,<2.0
 
 # Observability (Phase 6)
 langsmith>=0.8,<1.0
@@ -31,7 +34,9 @@ unstructured>=0.16       # richer doc parsing (optional)
 # Both are optional: the defaults (STORAGE_BACKEND=local, EVENT_BUS=sqlite)
 # need neither. Install for STORAGE_BACKEND=s3 / EVENT_BUS=kafka.
 boto3>=1.35              # S3 / MinIO object storage
-kafka-python>=2.0        # Kafka event bus
+# The maintained fork; the original kafka-python does not import on
+# Python 3.12+. Both provide the same `kafka` module.
+kafka-python-ng>=2.2     # Kafka event bus
 
 # Evaluation (Phase 2)
 ragas>=0.2,<0.3               # pin to 0.2.x; 0.4+ has broken langchain imports
@@ -44,6 +49,7 @@ pydantic>=2.0
 fastapi>=0.115           # Phase 7
 uvicorn>=0.32            # Phase 7
 slowapi>=0.1.9           # Rate limiting (Phase 7)
+redis>=5.0               # Shared rate limit counters across API replicas
 streamlit>=1.40          # Chat UI (Phase 7)
 
 # Testing

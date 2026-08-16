@@ -18,10 +18,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.llm_pool import get_llm
+from src.prompts import register
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,11 @@ _RERANK_SYSTEM = (
     "Be strict — only score 7+ if the document clearly helps answer the question."
 )
 
+# Registered even though it is passed as a raw system message rather than
+# a template: a prompt left out of the inventory is a prompt whose change
+# cannot be correlated with a change in retrieval quality.
+register("rerank_relevance", "v1", [("system", _RERANK_SYSTEM)])
+
 
 class RerankRetriever(BaseRetriever):
     """Retrieves candidates from dense store, then reranks with LLM scoring."""
@@ -62,7 +69,7 @@ class RerankRetriever(BaseRetriever):
 
     def _score_document(
         self,
-        llm: ChatOpenAI,
+        llm: Runnable,
         question: str,
         doc: Document,
     ) -> tuple[Document, int]:
@@ -100,13 +107,7 @@ class RerankRetriever(BaseRetriever):
         if not candidates:
             return []
 
-        llm = ChatOpenAI(
-            model=settings.llm_model,
-            temperature=0,
-            api_key=settings.openai_api_key,
-            timeout=settings.llm_timeout,
-            max_retries=settings.llm_max_retries,
-        )
+        llm = get_llm(temperature=0)
 
         # Score documents in parallel using thread pool
         max_workers = min(settings.rerank_max_workers, len(candidates))

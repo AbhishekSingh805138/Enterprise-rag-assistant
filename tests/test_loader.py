@@ -1,10 +1,11 @@
 """Tests for the document loader."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from src.ingestion.loader import _infer_access_level, _infer_department, load_path
-from pathlib import Path
 
 
 class TestInferDepartment:

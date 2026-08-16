@@ -11,11 +11,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # TestChromaRefresh
@@ -91,8 +90,8 @@ class TestDocumentTTL:
     @patch("src.vectorstore.chroma_store.get_vectorstore")
     def test_get_stale_detects_old_docs(self, mock_get_vs):
         """Documents older than max_age_days should be detected as stale."""
-        old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
-        fresh_ts = datetime.now(timezone.utc).isoformat()
+        old_ts = (datetime.now(UTC) - timedelta(days=60)).isoformat()
+        fresh_ts = datetime.now(UTC).isoformat()
 
         mock_store = MagicMock()
         mock_store.get.return_value = {
@@ -114,7 +113,7 @@ class TestDocumentTTL:
     @patch("src.vectorstore.chroma_store.get_vectorstore")
     def test_delete_stale_removes_docs(self, mock_get_vs):
         """delete_stale_documents should call store.delete with stale IDs."""
-        old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        old_ts = (datetime.now(UTC) - timedelta(days=60)).isoformat()
 
         mock_store = MagicMock()
         mock_store.get.return_value = {
@@ -226,7 +225,7 @@ class TestSemanticCache:
             cache.store("What is PTO?", "PTO is paid time off.", ttl=1)
 
             # Manually backdate the entry
-            old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+            old_ts = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
             cache._conn.execute(
                 "UPDATE semantic_cache SET created_at = ?", (old_ts,)
             )
@@ -265,8 +264,8 @@ class TestSemanticCache:
 
         cache = SemanticCache(":memory:")
         # Insert entries directly with backdated timestamps
-        old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-        fresh_ts = datetime.now(timezone.utc).isoformat()
+        old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        fresh_ts = datetime.now(UTC).isoformat()
         cache._conn.execute(
             "INSERT INTO semantic_cache (query, answer, embedding, created_at, ttl) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -294,7 +293,7 @@ class TestSemanticCache:
         cache._conn.execute(
             "INSERT INTO semantic_cache (query, answer, embedding, created_at, ttl) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("q1", "a1", "[]", datetime.now(timezone.utc).isoformat(), 3600),
+            ("q1", "a1", "[]", datetime.now(UTC).isoformat(), 3600),
         )
         cache._conn.commit()
         stats = cache.stats()

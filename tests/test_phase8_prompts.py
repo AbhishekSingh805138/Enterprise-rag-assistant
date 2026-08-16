@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # ---------------------------------------------------------------------------
 # TestPartialAnswerPrompt
 # ---------------------------------------------------------------------------
@@ -223,6 +222,7 @@ class TestToolsDisabledDefault:
     def test_graph_has_no_tool_router_by_default(self):
         """With default settings, tool_router is not in the graph."""
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph, reset_graph
 
         reset_graph()
@@ -239,6 +239,7 @@ class TestToolsDisabledDefault:
     def test_graph_has_tool_router_when_enabled(self):
         """With ENABLE_TOOLS=true, tool_router is in the graph."""
         from langgraph.checkpoint.memory import InMemorySaver
+
         from src.graph.build_graph import build_graph, reset_graph
 
         reset_graph()

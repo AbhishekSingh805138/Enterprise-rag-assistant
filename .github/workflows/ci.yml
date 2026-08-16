@@ -1,4 +1,4 @@
-name: CI — Test & Lint
+name: CI
 
 on:
   push:
@@ -7,9 +7,116 @@ on:
     branches: [main]
 
 jobs:
+  # Cheap checks first so an obvious mistake fails in under a minute
+  # rather than after the full suite.
+  lint:
+    name: Lint, types & vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install tooling
+        run: pip install ruff mypy pip-audit
+
+      - name: Ruff
+        run: ruff check --output-format=github .
+
+      # Advisory for now: the codebase has no annotations on much of its
+      # surface, so a hard gate would fail on absence rather than on error.
+      # Tighten module by module as annotations land.
+      - name: Mypy (advisory)
+        run: mypy --ignore-missing-imports --no-strict-optional src api config.py || true
+
+      # Fails the build on any known CVE that is not an accepted exception.
+      # This check was missing entirely; its first run found four.
+      #
+      # Every --ignore-vuln below is justified in SECURITY.md with an exit
+      # condition. Keep the two lists in step — pip-audit has no config
+      # file, so these flags are the only place the ignores take effect.
+      - name: Dependency vulnerability audit
+        run: |
+          REQ=requirements.txt
+          [ -f requirements.lock ] && REQ=requirements.lock
+          pip-audit --strict --requirement "$REQ" \
+            --ignore-vuln PYSEC-2026-311 \
+            --ignore-vuln PYSEC-2026-3046 \
+            --ignore-vuln PYSEC-2026-3047 \
+            --ignore-vuln PYSEC-2026-2447
+
+  # Fast, hermetic. Backends are faked; no services required.
   test:
+    name: Unit & component tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Prefer the lockfile so CI installs exactly what production runs.
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.lock ]; then
+            pip install --require-hashes -r requirements.lock
+          else
+            echo "::warning::requirements.lock missing — installing unpinned"
+            pip install -r requirements.txt
+          fi
+
+      - name: Run tests
+        run: pytest --tb=short -q
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  # Proves the shipped image actually builds and starts, and scans it for
+  # OS/library CVEs. Previously nothing built the production image at all.
+  image:
+    name: Build & scan production image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build -f Dockerfile.prod -t rag-assistant:ci .
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: rag-assistant:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - name: Smoke-test the entrypoint
+        run: |
+          docker run --rm -e OPENAI_API_KEY=sk-ci-smoke rag-assistant:ci \
+            python -c "import api.app; print('app imports OK')"
+
+  # The production backends. Everything above fakes Kafka and S3, which
+  # proves the call contracts but not that they work — this job is the only
+  # place the shipped production configuration is actually exercised. It is
+  # what caught a Chroma client/server major-version mismatch and a Kafka
+  # image that no longer exists on Docker Hub.
+  integration:
+    name: Integration (real Kafka / MinIO / Chroma)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +130,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tests
-        run: pytest --tb=short -q
+      - name: Validate deployment compose files
+        run: |
+          docker compose -f docker-compose.prod.yml config --quiet
+          docker compose -f docker-compose.test.yml config --quiet
+          docker compose -f docker-compose.yml config --quiet
+
+      - name: Start backing services
+        run: docker compose -f docker-compose.test.yml up -d --wait --wait-timeout 180
+
+      - name: Show service state
+        run: docker compose -f docker-compose.test.yml ps
+
+      - name: Run integration tests
+        run: pytest -m integration --tb=short -q
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs --tail=120
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

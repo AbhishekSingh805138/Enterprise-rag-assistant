@@ -19,12 +19,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # === Config validation edge cases ===
 
 class TestConfigValidation:
     def test_invalid_log_level_raises(self):
         from dataclasses import replace
+
         from config import settings
         bad = replace(settings, log_level="BOGUS")
         with pytest.raises(ValueError, match="Invalid LOG_LEVEL"):
@@ -32,6 +32,7 @@ class TestConfigValidation:
 
     def test_valid_log_levels_accepted(self):
         from dataclasses import replace
+
         from config import settings
         for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             s = replace(settings, log_level=level)
@@ -41,6 +42,7 @@ class TestConfigValidation:
 
     def test_case_insensitive_log_level(self):
         from dataclasses import replace
+
         from config import settings
         s = replace(settings, log_level="debug", openai_api_key="sk-test")
         s.validate()  # should not raise

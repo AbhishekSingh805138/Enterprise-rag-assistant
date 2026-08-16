@@ -16,7 +16,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from config import settings
@@ -33,7 +33,7 @@ class EventBusError(RuntimeError):
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass
@@ -67,7 +67,7 @@ class Event:
         )
 
     @classmethod
-    def from_json(cls, raw: str | bytes) -> "Event":
+    def from_json(cls, raw: str | bytes) -> Event:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         try:
@@ -89,7 +89,7 @@ class Event:
         except (KeyError, TypeError, ValueError) as e:
             raise EventBusError(f"Event is missing required fields: {e}") from e
 
-    def next_attempt(self) -> "Event":
+    def next_attempt(self) -> Event:
         """Return a copy of this event marked as one delivery further along."""
         return Event(
             event_type=self.event_type,

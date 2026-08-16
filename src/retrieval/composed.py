@@ -11,10 +11,10 @@ import logging
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from langchain_openai import ChatOpenAI
 from pydantic import Field, PrivateAttr
 
 from config import settings
+from src.llm_pool import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +44,9 @@ class ComposedRetriever(BaseRetriever):
 
     def _rerank_with_llm(self, query: str, candidates: list[Document]) -> list[Document]:
         """Rerank candidates using LLM scoring."""
-        from src.retrieval.rerank import RelevanceScore, _RERANK_SYSTEM
+        from src.retrieval.rerank import _RERANK_SYSTEM, RelevanceScore
 
-        llm = ChatOpenAI(
-            model=settings.llm_model,
-            temperature=0,
-            api_key=settings.openai_api_key,
-            timeout=settings.llm_timeout,
-            max_retries=settings.llm_max_retries,
-        )
+        llm = get_llm(temperature=0)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -94,7 +88,7 @@ class ComposedRetriever(BaseRetriever):
         pairs = [(query, doc.page_content) for doc in candidates]
         scores = model.predict(pairs, batch_size=settings.cross_encoder_batch_size)
 
-        scored = list(zip(candidates, scores))
+        scored = list(zip(candidates, scores, strict=True))
         scored.sort(key=lambda x: float(x[1]), reverse=True)
         return [doc for doc, _ in scored[:self.k]]
 

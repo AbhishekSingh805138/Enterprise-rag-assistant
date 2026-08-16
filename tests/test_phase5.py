@@ -17,13 +17,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.documents import Document
 
-
 # === Planner tests ===
 
 class TestPlanner:
     def test_simple_question_passthrough(self):
         """Simple question should set is_multi_part=False with original as sole sub-question."""
-        from src.graph.planner import PlanResult, planner, _planner_prompt
+        from src.graph.planner import PlanResult, _planner_prompt, planner
 
         mock_chain = MagicMock()
         mock_chain.invoke.return_value = PlanResult(
@@ -83,7 +82,7 @@ class TestPlanner:
 
     def test_planner_clamps_sub_questions(self):
         """Planner should cap sub-questions at MAX_SUB_QUESTIONS."""
-        from src.graph.planner import PlanResult, planner, MAX_SUB_QUESTIONS
+        from src.graph.planner import MAX_SUB_QUESTIONS, PlanResult, planner
 
         mock_chain = MagicMock()
         mock_chain.invoke.return_value = PlanResult(
@@ -488,8 +487,9 @@ class TestDataLookup:
 class TestGraphIntegration:
     def test_simple_path_through_planner(self):
         """Simple question should go through planner → retrieve → ... → critic."""
-        from src.graph import build_graph as bg
         from langgraph.checkpoint.memory import InMemorySaver
+
+        from src.graph import build_graph as bg
 
         def fake_planner(state):
             return {
@@ -537,8 +537,9 @@ class TestGraphIntegration:
 
     def test_multi_part_path_through_planner(self):
         """Multi-part question should go planner → sub-query loop → synthesize → critic."""
-        from src.graph import build_graph as bg
         from langgraph.checkpoint.memory import InMemorySaver
+
+        from src.graph import build_graph as bg
 
         def fake_planner(state):
             return {

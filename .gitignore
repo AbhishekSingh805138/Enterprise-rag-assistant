@@ -43,3 +43,7 @@ htmlcov/
 .idea/
 .vscode/
 .claude/
+# Chroma server-mode persistence (local dev only)
+chroma_server/
+# Volume backups
+backups/

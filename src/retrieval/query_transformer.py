@@ -13,6 +13,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from config import settings
+from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
@@ -68,7 +69,10 @@ def _intent_rewrite(query: str, intent: str) -> str:
         return ""
 
     try:
-        prompt = ChatPromptTemplate.from_messages([
+        prompt = register(
+            "query_transform",
+            "v1",
+            [
             ("system", prompt_template),
         ])
         cb = get_breaker(

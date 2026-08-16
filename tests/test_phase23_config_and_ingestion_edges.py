@@ -93,13 +93,33 @@ class TestSettingsValidation:
             make_settings(langsmith_tracing="true", langsmith_api_key="").validate()
         assert any("LANGSMITH_API_KEY" in r.message for r in caplog.records)
 
-    def test_ingestion_defaults_are_safe(self):
-        """Defaults must not enable async ingestion or require a broker."""
-        s = Settings()
-        assert s.async_ingestion is False
-        assert s.storage_backend == "local"
-        assert s.event_bus == "sqlite"
-        assert s.ingest_max_attempts == 3
+    @pytest.mark.parametrize(
+        "field,env_var,expected",
+        [
+            ("async_ingestion", "ASYNC_INGESTION", "false"),
+            ("storage_backend", "STORAGE_BACKEND", "local"),
+            ("event_bus", "EVENT_BUS", "sqlite"),
+            ("ingest_max_attempts", "INGEST_MAX_ATTEMPTS", "3"),
+            ("chroma_mode", "CHROMA_MODE", "embedded"),
+        ],
+    )
+    def test_ingestion_defaults_are_safe(self, field, env_var, expected):
+        """A clone with no configuration must run without broker or server.
+
+        Asserted against the source rather than `Settings()`, because
+        config.py always loads the project's .env — so a developer who
+        enables async ingestion locally would otherwise fail this. What
+        matters is the value shipped to someone who has configured nothing.
+        """
+        import inspect
+        import re
+
+        source = inspect.getsource(Settings)
+        # Match the env lookup itself; the variable name may be wrapped in a
+        # converter (int(...), .lower() == "true"), which differs per field.
+        match = re.search(rf'os\.getenv\(\s*"{env_var}"\s*,\s*"([^"]+)"', source)
+        assert match, f"default for {field} ({env_var}) not found in config.Settings"
+        assert match.group(1) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -414,9 +434,8 @@ class TestPipelineErrors:
         store.put("documents/hr/doc_1/f.md", b"body")
         with patch(
             "src.ingestion.loader.load_path", side_effect=FileNotFoundError("no docs")
-        ):
-            with pytest.raises(DocumentParseError, match="Could not parse"):
-                process_document(self._record(tmp_path), object_store=store)
+        ), pytest.raises(DocumentParseError, match="Could not parse"):
+            process_document(self._record(tmp_path), object_store=store)
 
     def test_document_producing_no_chunks_is_a_permanent_error(self, tmp_path):
         from src.ingestion.pipeline import DocumentParseError, process_document
@@ -487,17 +506,15 @@ class TestSqliteQueueInternals:
     def test_publish_failure_is_wrapped(self, bus):
         from src.events.bus import EventBusError
 
-        with self.broken(bus):
-            with pytest.raises(EventBusError, match="Failed to publish"):
-                bus.publish("t", self._event())
+        with self.broken(bus), pytest.raises(EventBusError, match="Failed to publish"):
+            bus.publish("t", self._event())
 
     def test_poll_failure_is_wrapped(self, bus):
         from src.events.bus import EventBusError
 
         bus.publish("t", self._event())
-        with self.broken(bus, "locked"):
-            with pytest.raises(EventBusError, match="Failed to poll"):
-                bus.poll("t", "g")
+        with self.broken(bus, "locked"), pytest.raises(EventBusError, match="Failed to poll"):
+            bus.poll("t", "g")
 
     def test_ack_failure_does_not_raise(self, bus):
         bus.publish("t", self._event())

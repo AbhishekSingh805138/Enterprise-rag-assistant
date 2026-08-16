@@ -10,7 +10,7 @@ file and skipped rather than aborting a whole directory ingest.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -19,6 +19,53 @@ from langchain_core.documents import Document
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".csv", ".txt", ".md"}
+
+# File types whose loader needs a package that is not guaranteed to be
+# installed. Declaring a type here means the upload API will refuse it
+# with a clear message when the dependency is absent, rather than
+# accepting the file and dead-lettering it seconds later.
+OPTIONAL_DEPENDENCIES = {
+    ".pdf": "pypdf",
+    ".docx": "docx2txt",
+}
+
+_availability_cache: dict[str, bool] = {}
+
+
+def _dependency_installed(module: str) -> bool:
+    """Whether *module* can be imported, without importing it."""
+    if module not in _availability_cache:
+        import importlib.util
+
+        try:
+            _availability_cache[module] = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            _availability_cache[module] = False
+    return _availability_cache[module]
+
+
+def missing_dependency(suffix: str) -> str | None:
+    """Return the package needed to load *suffix*, or None if it is ready."""
+    module = OPTIONAL_DEPENDENCIES.get(suffix.lower())
+    if module and not _dependency_installed(module):
+        return module
+    return None
+
+
+def available_suffixes() -> frozenset[str]:
+    """Suffixes this deployment can actually parse right now.
+
+    Distinct from SUPPORTED_SUFFIXES, which is what the code knows how to
+    handle in principle. Validation must use this one: promising a
+    capability the runtime lacks turns a clean 400 into an accepted upload
+    that fails asynchronously, where the user never sees the reason.
+    """
+    return frozenset(s for s in SUPPORTED_SUFFIXES if missing_dependency(s) is None)
+
+
+def reset_availability_cache() -> None:
+    """Clear the cached dependency probes (tests, or after an install)."""
+    _availability_cache.clear()
 
 
 def _load_docx(path: Path) -> list[Document]:
@@ -45,8 +92,10 @@ def _load_csv(path: Path) -> list[Document]:
 
     return CSVLoader(str(path), encoding="utf-8").load()
 
-# Documents in these folders are marked confidential; everything else is internal.
-_CONFIDENTIAL_DEPARTMENTS = {"legal", "security"}
+# Documents in these folders are marked confidential; everything else is
+# internal. Shared with the retrieval scoping rules so "confidential"
+# means the same thing at write time and at read time.
+from src.security.access_control import CONFIDENTIAL_DEPARTMENTS as _CONFIDENTIAL_DEPARTMENTS
 
 
 def _infer_department(file_path: Path, root: Path) -> str:
@@ -116,7 +165,7 @@ def load_path(path: str | Path) -> list[Document]:
             d.metadata["filename"] = f.name
             d.metadata["department"] = department
             d.metadata["access_level"] = access_level
-            d.metadata["ingested_at"] = datetime.now(timezone.utc).isoformat()
+            d.metadata["ingested_at"] = datetime.now(UTC).isoformat()
         docs.extend(loaded)
 
         logger.info(

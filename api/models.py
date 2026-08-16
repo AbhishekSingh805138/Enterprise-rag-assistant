@@ -5,10 +5,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-# Allowed department names for upload and data lookup.
-VALID_DEPARTMENTS = frozenset({
-    "general", "hr", "legal", "engineering", "finance", "security", "operations",
-})
+from src.security.access_control import VALID_DEPARTMENTS as ACCESS_CONTROL_DEPARTMENTS
+
+# Allowed department names for upload and data lookup. Re-exported from
+# the access-control module so the API and the retrieval scoping rules
+# can never disagree about which departments exist — a name valid in one
+# place but not the other would be either an upload that cannot be read
+# back, or a scope that silently grants nothing.
+VALID_DEPARTMENTS = ACCESS_CONTROL_DEPARTMENTS
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,19 @@ class DocumentListResponse(BaseModel):
     documents: list[DocumentStatusResponse]
     count: int
     stats: dict[str, int]
+
+
+class DocumentRetryResponse(BaseModel):
+    """Result of requeueing a failed or dead-lettered document."""
+
+    document_id: str
+    filename: str = ""
+    outcome: str = Field(
+        ..., description="requeued | already_processed | not_replayable | publish_failed"
+    )
+    detail: str = ""
+    requeued: bool = False
+    status_url: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,6 @@ from langchain_core.documents import Document
 
 from src.retrieval.factory import STRATEGIES, get_retriever
 
-
 # === Factory tests ===
 
 class TestFactory:
@@ -165,7 +164,7 @@ class TestMultiQueryRetriever:
 class TestRerankRetriever:
     def test_rerank_sorts_by_score(self):
         """Documents should be returned in descending score order."""
-        from src.retrieval.rerank import RerankRetriever, RelevanceScore
+        from src.retrieval.rerank import RelevanceScore, RerankRetriever
 
         retriever = RerankRetriever(k=2, fetch_k=4)
 
@@ -185,7 +184,7 @@ class TestRerankRetriever:
             mock_llm = MagicMock()
             mock_llm.with_structured_output.return_value.invoke.side_effect = scores
 
-            with patch("src.retrieval.rerank.ChatOpenAI", return_value=mock_llm):
+            with patch("src.retrieval.rerank.get_llm", return_value=mock_llm):
                 results = retriever._get_relevant_documents("test query")
 
         assert len(results) == 2

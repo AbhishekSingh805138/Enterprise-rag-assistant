@@ -15,8 +15,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableParallel, RunnablePassthrough
-
-from config import settings
+from src.prompts import register
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,10 @@ SYSTEM_PROMPT = (
     "Context:\n{context}"
 )
 
-_prompt = ChatPromptTemplate.from_messages(
+_prompt = register(
+    "naive_rag_answer",
+    "v1",
+
     [("system", SYSTEM_PROMPT), ("human", "{question}")]
 )
 
@@ -56,8 +58,8 @@ def build_naive_rag_chain(
     retriever_strategy: str = "dense",
 ) -> Runnable:
     """Compose the LCEL chain: {context, question} -> prompt -> llm -> str."""
-    from src.retrieval import get_retriever
     from src.llm_pool import get_llm
+    from src.retrieval import get_retriever
     retriever = get_retriever(strategy=retriever_strategy, k=k, filter=filter)
     llm = get_llm(temperature=0)
 

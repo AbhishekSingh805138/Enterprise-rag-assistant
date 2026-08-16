@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import contextvars
 import logging
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
 
@@ -51,7 +51,10 @@ class PlanResult(BaseModel):
 
 # --- Prompts ------------------------------------------------------------------
 
-_planner_prompt = ChatPromptTemplate.from_messages(
+_planner_prompt = register(
+    "planner_decompose",
+    "v1",
+
     [
         (
             "system",
@@ -96,7 +99,10 @@ _planner_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-_synthesize_prompt = ChatPromptTemplate.from_messages(
+_synthesize_prompt = register(
+    "planner_synthesize",
+    "v1",
+
     [
         (
             "system",
@@ -122,7 +128,7 @@ _synthesize_prompt = ChatPromptTemplate.from_messages(
 )
 
 
-def _llm(temperature: float = 0) -> ChatOpenAI:
+def _llm(temperature: float = 0) -> Runnable:
     """Return a cached LLM instance from the pool."""
     return get_llm(temperature=temperature)
 
@@ -185,7 +191,8 @@ def _process_single_sub_query(sub_q: str, strategy: str) -> tuple[str, list]:
     # Mini-CRAG: if docs seem irrelevant, rewrite and retry once
     if docs and settings.sub_query_max_retries > 0:
         try:
-            from src.graph.nodes import _llm as _nodes_llm, GradeResult, _grade_prompt
+            from src.graph.nodes import GradeResult, _grade_prompt
+            from src.graph.nodes import _llm as _nodes_llm
             grader = _grade_prompt | _nodes_llm().with_structured_output(GradeResult)
             context = "\n\n".join(d.page_content for d in docs[:3])
             verdict = grader.invoke({"question": sub_q, "context": context})
@@ -209,8 +216,8 @@ def _process_single_sub_query(sub_q: str, strategy: str) -> tuple[str, list]:
         answer = f"I don't have enough information in the available documents to answer: {sub_q}"
     else:
         try:
-            from src.graph.nodes import _gen_prompt
             from src.context.context_builder import build_context
+            from src.graph.nodes import _gen_prompt
             chain = _gen_prompt | _llm() | StrOutputParser()
             built = build_context(docs, query=sub_q)
             context = built.text
@@ -281,7 +288,7 @@ def synthesize(state: dict) -> dict:
     # Format sub-answers for the synthesis prompt
     formatted = "\n\n".join(
         f"--- Sub-question {i+1}: {q} ---\n{a}"
-        for i, (q, a) in enumerate(zip(sub_questions, sub_answers))
+        for i, (q, a) in enumerate(zip(sub_questions, sub_answers, strict=True))
     )
 
     try:
@@ -296,7 +303,8 @@ def synthesize(state: dict) -> dict:
         logger.exception("Synthesis failed — concatenating sub-answers")
         # Fallback: simple concatenation
         fallback = "\n\n".join(
-            f"**{q}**\n{a}" for q, a in zip(sub_questions, sub_answers)
+            f"**{q}**\n{a}"
+            for q, a in zip(sub_questions, sub_answers, strict=True)
         )
         return {"generation": fallback, "question": original_question}
 

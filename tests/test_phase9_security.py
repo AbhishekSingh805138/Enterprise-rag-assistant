@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -286,11 +285,11 @@ class TestConfigValidation:
 
     def test_max_upload_size_mb_positive(self):
         """max_upload_size_mb must be positive."""
-        from config import Settings
-
         # Settings is a frozen dataclass evaluated at construction time via os.getenv.
         # We must construct a fresh one with the bad value to test validation.
         import dataclasses
+
+        from config import Settings
         base = Settings()
         # Create a copy with max_upload_size_mb=0 (bypass frozen via replace)
         s = dataclasses.replace(base, max_upload_size_mb=0, openai_api_key="sk-test")

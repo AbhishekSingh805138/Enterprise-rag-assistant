@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,16 +15,77 @@ load_dotenv()  # reads .env in the project root
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
 
+def _secret(name: str, default: str = "") -> str:
+    """Read a secret, preferring a file over an environment variable.
+
+    ``<NAME>_FILE`` pointing at a path wins over ``<NAME>``. This is the
+    convention Docker secrets and Kubernetes secret volumes use, and it
+    keeps credentials out of the process environment — where they are
+    visible to ``docker inspect``, crash dumps, child processes and any
+    library that logs its config.
+
+    Falls back to the plain variable so local development and the existing
+    ``.env`` keep working unchanged.
+    """
+    path = os.getenv(f"{name}_FILE", "").strip()
+    if path:
+        try:
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise RuntimeError(
+                f"{name}_FILE is set to {path!r} but could not be read: {e}"
+            ) from e
+        if not value:
+            raise RuntimeError(f"{name}_FILE at {path!r} is empty.")
+        return value
+    return os.getenv(name, default)
+
+
 @dataclass(frozen=True)
 class Settings:
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_api_key: str = _secret("OPENAI_API_KEY")
     llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    # ---- Model providers -------------------------------------------------
+    # Chat models are interchangeable, so a second vendor can answer when
+    # the first is unavailable. Blank fallback = no failover (the original
+    # behaviour): a primary outage is then a total outage.
+    llm_provider: str = os.getenv("LLM_PROVIDER", "openai")
+    llm_fallback_provider: str = os.getenv("LLM_FALLBACK_PROVIDER", "")
+    llm_fallback_model: str = os.getenv("LLM_FALLBACK_MODEL", "")
+
+    # Embeddings are NOT interchangeable: vectors from two models are not
+    # comparable, so there is deliberately no embedding fallback. Changing
+    # this requires re-indexing, which the vector store enforces.
+    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "openai")
+
+    anthropic_api_key: str = _secret("ANTHROPIC_API_KEY")
+    azure_openai_endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    azure_openai_api_key: str = _secret("AZURE_OPENAI_API_KEY")
+    azure_openai_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+    azure_openai_deployment: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+    azure_embedding_deployment: str = os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "")
     chroma_dir: str = os.getenv("CHROMA_DIR", str(PROJECT_ROOT / "chroma_db"))
     chroma_collection: str = os.getenv("CHROMA_COLLECTION", "enterprise_docs")
+
+    # Vector store mode. "embedded" keeps ChromaDB in-process against
+    # CHROMA_DIR; "server" talks to a ChromaDB server over HTTP.
+    #
+    # Embedded mode caches its index in the process that opened it and
+    # cannot observe writes made by any other process — so an API server
+    # will never see documents indexed by a separate ingestion worker
+    # until it restarts. Any multi-process deployment (ASYNC_INGESTION,
+    # more than one uvicorn worker) needs server mode.
+    chroma_mode: str = os.getenv("CHROMA_MODE", "embedded")
+    chroma_host: str = os.getenv("CHROMA_HOST", "localhost")
+    chroma_port: int = int(os.getenv("CHROMA_PORT", "8001"))
+    chroma_ssl: bool = os.getenv("CHROMA_SSL", "false").lower() == "true"
+    # Optional bearer token when the server runs with auth enabled.
+    chroma_auth_token: str = _secret("CHROMA_AUTH_TOKEN")
     checkpoint_dir: str = os.getenv("CHECKPOINT_DIR", str(PROJECT_ROOT / "checkpoints"))
-    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
-    langsmith_api_key: str = os.getenv("LANGSMITH_API_KEY", "")
+    tavily_api_key: str = _secret("TAVILY_API_KEY")
+    langsmith_api_key: str = _secret("LANGSMITH_API_KEY")
     langsmith_tracing: str = os.getenv("LANGSMITH_TRACING", "")
     langsmith_project: str = os.getenv("LANGSMITH_PROJECT", "enterprise-rag-assistant")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
@@ -80,6 +141,12 @@ class Settings:
     rerank_fetch_k: int = int(os.getenv("RERANK_FETCH_K", "12"))
     rate_limit_per_minute: str = os.getenv("RATE_LIMIT_PER_MINUTE", "30/minute")
     heavy_rate_limit: str = os.getenv("HEAVY_RATE_LIMIT", "5/minute")
+    # Where rate limit counters live. Empty means in-process memory,
+    # which is correct only for a single replica: counters are not
+    # shared, so N replicas allow N x the configured limit and a restart
+    # resets them. Point this at Redis before scaling out.
+    #   RATE_LIMIT_STORAGE_URI=redis://redis:6379/0
+    rate_limit_storage_uri: str = os.getenv("RATE_LIMIT_STORAGE_URI", "")
     cost_budget_per_query: float = float(os.getenv("COST_BUDGET_PER_QUERY", "0.02"))
 
     # Ingestion is restricted to paths under this root (prevents arbitrary
@@ -97,7 +164,7 @@ class Settings:
 
     # Phase 17: Authentication & Guardrails
     auth_enabled: bool = os.getenv("AUTH_ENABLED", "false").lower() == "true"
-    api_keys: str = os.getenv("API_KEYS", "")
+    api_keys: str = _secret("API_KEYS")
     guardrails_enabled: bool = os.getenv("GUARDRAILS_ENABLED", "true").lower() == "true"
     max_query_length: int = int(os.getenv("MAX_QUERY_LENGTH", "2000"))
     pii_detection_enabled: bool = os.getenv("PII_DETECTION_ENABLED", "true").lower() == "true"
@@ -123,6 +190,12 @@ class Settings:
 
     # Phase 12: Query Transformer
     query_transform_enabled: bool = os.getenv("QUERY_TRANSFORM_ENABLED", "true").lower() == "true"
+
+    # Prompt overrides: a directory of <prompt-name>.json files that
+    # replace the shipped wording without a code change. An override must
+    # declare the same template variables as the built-in or it is
+    # rejected and the built-in is used.
+    prompt_override_dir: str = os.getenv("PROMPT_OVERRIDE_DIR", "")
 
     # Phase 14: Context Builder
     context_max_tokens: int = int(os.getenv("CONTEXT_MAX_TOKENS", "4000"))
@@ -186,6 +259,12 @@ class Settings:
 
     # Phase 8: Infrastructure
     chroma_refresh_interval: int = int(os.getenv("CHROMA_REFRESH_INTERVAL", "300"))
+    # How long a built BM25 index may be served before it is rebuilt. The
+    # index is an in-memory copy of the corpus, so a worker indexing a new
+    # document in another process cannot invalidate it — this bounds how
+    # stale sparse retrieval can get. The corpus size is also checked on
+    # each lookup, which catches most changes immediately.
+    bm25_cache_ttl: int = int(os.getenv("BM25_CACHE_TTL", "300"))
     document_ttl_days: int = int(os.getenv("DOCUMENT_TTL_DAYS", "0"))
     semantic_cache_enabled: bool = os.getenv("SEMANTIC_CACHE_ENABLED", "false").lower() == "true"
     semantic_cache_threshold: float = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.95"))
@@ -193,11 +272,43 @@ class Settings:
 
     _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
+    # Mirrored from src.llm.providers, which imports this module.
+    _CHAT_PROVIDERS = {"openai", "azure_openai", "anthropic"}
+    _EMBEDDING_PROVIDERS = {"openai", "azure_openai"}  # anthropic has no embeddings
+
     def validate(self) -> None:
-        if not self.openai_api_key:
+        providers = {self.llm_provider.lower(), self.embedding_provider.lower()}
+        if self.llm_fallback_provider:
+            providers.add(self.llm_fallback_provider.lower())
+        if "openai" in providers and not self.openai_api_key:
             raise RuntimeError(
                 "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key."
             )
+        if self.llm_provider.lower() not in self._CHAT_PROVIDERS:
+            raise ValueError(
+                f"Invalid LLM_PROVIDER {self.llm_provider!r}. "
+                f"Choose from: {', '.join(sorted(self._CHAT_PROVIDERS))}"
+            )
+        if self.embedding_provider.lower() not in self._EMBEDDING_PROVIDERS:
+            raise ValueError(
+                f"Invalid EMBEDDING_PROVIDER {self.embedding_provider!r}. "
+                f"Choose from: {', '.join(sorted(self._EMBEDDING_PROVIDERS))}"
+            )
+        if self.llm_fallback_provider:
+            fallback = self.llm_fallback_provider.lower()
+            if fallback not in self._CHAT_PROVIDERS:
+                raise ValueError(
+                    f"Invalid LLM_FALLBACK_PROVIDER {self.llm_fallback_provider!r}. "
+                    f"Choose from: {', '.join(sorted(self._CHAT_PROVIDERS))}"
+                )
+            if fallback == self.llm_provider.lower():
+                # Failing over to the vendor that just went down is not
+                # failover; it would look configured while covering nothing.
+                raise ValueError(
+                    f"LLM_FALLBACK_PROVIDER is the same vendor as LLM_PROVIDER "
+                    f"({fallback}). A fallback on the same provider does not "
+                    f"survive that provider's outage."
+                )
         if self.log_level.upper() not in self._VALID_LOG_LEVELS:
             raise ValueError(
                 f"Invalid LOG_LEVEL {self.log_level!r}. "
@@ -225,6 +336,27 @@ class Settings:
             raise ValueError(
                 f"Invalid CRITIC_MODE {self.critic_mode!r}. Choose from: always, adaptive, off"
             )
+        if self.chroma_mode.lower() not in {"embedded", "server"}:
+            raise ValueError(
+                f"Invalid CHROMA_MODE {self.chroma_mode!r}. Choose from: embedded, server"
+            )
+        if self.chroma_mode.lower() == "server" and not self.chroma_host:
+            raise ValueError("CHROMA_MODE=server requires CHROMA_HOST to be set.")
+        if self.async_ingestion and self.chroma_mode.lower() == "embedded":
+            logging.getLogger(__name__).warning(
+                "ASYNC_INGESTION=true with CHROMA_MODE=embedded: the ingestion "
+                "worker runs in a separate process, and embedded ChromaDB cannot "
+                "see another process's writes — documents indexed by the worker "
+                "will not be retrievable until this process restarts. "
+                "Set CHROMA_MODE=server."
+            )
+        if self.rate_limit_storage_uri:
+            allowed = ("redis://", "rediss://", "redis+sentinel://", "memcached://", "memory://")
+            if not self.rate_limit_storage_uri.startswith(allowed):
+                raise ValueError(
+                    f"Invalid RATE_LIMIT_STORAGE_URI {self.rate_limit_storage_uri!r}. "
+                    f"Expected one of: {', '.join(allowed)}"
+                )
         if self.storage_backend.lower() not in {"local", "s3"}:
             raise ValueError(
                 f"Invalid STORAGE_BACKEND {self.storage_backend!r}. Choose from: local, s3"
@@ -272,7 +404,7 @@ class _JsonFormatter(logging.Formatter):
         from src.observability.request_context import get_request_id
 
         payload = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

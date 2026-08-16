@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from langchain_core.documents import Document
 

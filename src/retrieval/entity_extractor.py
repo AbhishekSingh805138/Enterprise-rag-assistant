@@ -12,6 +12,7 @@ import re
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.prompts import register
 from src.llm_pool import get_llm
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 
@@ -104,7 +105,10 @@ def extract_entities(query: str) -> list[Entity]:
     try:
         from langchain_core.prompts import ChatPromptTemplate
 
-        prompt = ChatPromptTemplate.from_messages([
+        prompt = register(
+            "entity_extract",
+            "v1",
+            [
             ("system", _EXTRACT_PROMPT_TEXT),
             ("human", "{query}"),
         ])

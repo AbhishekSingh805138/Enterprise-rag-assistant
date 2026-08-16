@@ -136,6 +136,7 @@ class TestIntentDetectNode:
         """When the LLM call fails, should fall back to heuristic."""
         _set_setting("intent_detection_enabled", True)
         from unittest.mock import patch
+
         from src.graph.intent_detector import intent_detect
 
         # Mock the circuit breaker to raise an exception
@@ -147,8 +148,9 @@ class TestIntentDetectNode:
 
     def test_returns_valid_intent_keys(self):
         _set_setting("intent_detection_enabled", True)
-        from src.graph.intent_detector import intent_detect, VALID_INTENTS
         from unittest.mock import patch
+
+        from src.graph.intent_detector import VALID_INTENTS, intent_detect
 
         with patch("src.graph.intent_detector.get_breaker") as mock_cb:
             mock_cb.return_value.call.side_effect = Exception("LLM down")

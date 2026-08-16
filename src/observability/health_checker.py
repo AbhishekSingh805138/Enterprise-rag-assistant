@@ -57,11 +57,23 @@ def _check_chromadb() -> HealthCheck:
         from src.vectorstore.chroma_store import collection_stats
         stats = collection_stats()
         latency = (time.perf_counter() - start) * 1000
+        where = stats.get("endpoint") or stats.get("persist_directory") or "?"
+        detail = (
+            f"{stats['document_count']} documents in {stats['collection']} "
+            f"({stats.get('mode', 'embedded')}: {where})"
+        )
+        # Embedded mode cannot observe writes from the ingestion worker, so
+        # surface the combination that silently serves stale results.
+        status = "ok"
+        if settings.async_ingestion and stats.get("mode") == "embedded":
+            status = "degraded"
+            detail += " — WARNING: embedded mode with async ingestion; documents "
+            detail += "indexed by the worker will not be visible until restart"
         return HealthCheck(
             name="chromadb",
-            status="ok",
+            status=status,
             latency_ms=latency,
-            detail=f"{stats['document_count']} documents in {stats['collection']}",
+            detail=detail,
         )
     except Exception as e:
         latency = (time.perf_counter() - start) * 1000

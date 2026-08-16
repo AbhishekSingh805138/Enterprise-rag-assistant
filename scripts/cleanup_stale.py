@@ -7,8 +7,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import logging
-import sys
 
 from config import setup_logging
 
@@ -29,7 +27,6 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging()
-    logger = logging.getLogger(__name__)
 
     from src.vectorstore.chroma_store import delete_stale_documents, get_stale_documents
 

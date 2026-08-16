@@ -45,6 +45,25 @@ def _disable_api_rate_limit():
 
 
 @pytest.fixture
+def redis_uri() -> str:
+    """URI of the Redis in docker-compose.test.yml, skipping if it is down.
+
+    Used by tests marked ``integration``; those are excluded by default so
+    the everyday suite needs no containers.
+    """
+    import os
+
+    uri = os.getenv("TEST_REDIS_URL", "redis://localhost:6380/0")
+    try:
+        import redis
+
+        redis.Redis.from_url(uri, socket_connect_timeout=2).ping()
+    except Exception as e:
+        pytest.skip(f"Redis not reachable at {uri}: {e}")
+    return uri
+
+
+@pytest.fixture
 def sample_documents() -> list[Document]:
     """A small set of Document objects for unit tests (no API calls needed)."""
     return [

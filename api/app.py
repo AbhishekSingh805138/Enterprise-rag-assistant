@@ -34,26 +34,14 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from starlette.responses import JSONResponse
-
-from config import settings, setup_logging
-from src.observability.request_context import (
-    get_request_id,
-    new_request_id,
-    reset_request_id,
-    set_request_id,
-)
-from src.security.auth import verify_api_key
-from src.security.guardrails import check_guardrails
-from src.security.output_filter import filter_output
 
 from api.models import (
     AskRequest,
     AskResponse,
     DocumentListResponse,
+    DocumentRetryResponse,
     DocumentStatusResponse,
     ErrorResponse,
     EvalRequest,
@@ -64,6 +52,22 @@ from api.models import (
     UploadAcceptedResponse,
     UploadResponse,
 )
+from api.rate_limit import build_limiter, verify_storage
+from config import settings, setup_logging
+from src.observability.request_context import (
+    get_request_id,
+    new_request_id,
+    reset_request_id,
+    set_request_id,
+)
+from src.security.access_control import (
+    CONFIDENTIAL_DEPARTMENTS,
+    DepartmentForbidden,
+    enforce_scope,
+)
+from src.security.auth import permitted_departments, verify_api_key
+from src.security.guardrails import check_guardrails
+from src.security.output_filter import filter_output
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +133,7 @@ async def _iter_in_thread(sync_iter_factory, request: Request):
         while True:
             try:
                 kind, item = await asyncio.wait_for(queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if await request.is_disconnected():
                     return
                 continue
@@ -152,7 +156,7 @@ async def _iter_in_thread(sync_iter_factory, request: Request):
 # Rate limiter
 # ---------------------------------------------------------------------------
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = build_limiter()
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +168,42 @@ async def lifespan(app: FastAPI):
     setup_logging()
     settings.validate()
     logger.info("Enterprise RAG Assistant API starting (v%s)", VERSION)
+
+    # Surface degraded file-type support at boot, not on the first upload.
+    from src.ingestion.loader import SUPPORTED_SUFFIXES, available_suffixes, missing_dependency
+
+    unavailable = sorted(set(SUPPORTED_SUFFIXES) - available_suffixes())
+    if unavailable:
+        logger.warning(
+            "File types unavailable on this deployment (uploads will be rejected): %s",
+            ", ".join(f"{s} (needs {missing_dependency(s)})" for s in unavailable),
+        )
+    logger.info("Accepting uploads for: %s", ", ".join(sorted(available_suffixes())))
+
+    # Report retrieval scoping. An unscoped key can read every
+    # department including legal and security, so a deployment that
+    # believes it is segmented should be able to see that it is not.
+    if settings.auth_enabled:
+        from src.security.auth import _get_key_scopes
+
+        scopes = _get_key_scopes()
+        unscoped = sum(1 for v in scopes.scopes.values() if v is None)
+        if unscoped:
+            logger.warning(
+                "%d of %d API key(s) are unscoped and can retrieve from every "
+                "department, including %s. Scope them with "
+                "API_KEYS=<key>:hr|general.",
+                unscoped,
+                len(scopes.scopes),
+                ", ".join(sorted(CONFIDENTIAL_DEPARTMENTS)),
+            )
+        if scopes.any_scoped:
+            logger.info("Department scoping active on %d API key(s)", len(scopes.scopes) - unscoped)
+
+    # Probe the rate limiter's backend now. A shared store that is
+    # unreachable degrades to per-process counters, which looks healthy
+    # but silently multiplies the effective limit by the replica count.
+    verify_storage(limiter)
     yield
     logger.info("API shutting down")
 
@@ -227,10 +267,19 @@ async def request_id_middleware(request: Request, call_next):
 # GET /health
 # ---------------------------------------------------------------------------
 
-@app.get("/health", response_model=HealthResponse)
-async def health(deep: bool = False):
-    """Liveness check with collection stats. Pass ?deep=true for subsystem checks."""
+@app.get("/health", response_model=None, responses={401: {"model": ErrorResponse}})
+async def health(request: Request, deep: bool = False):
+    """Liveness check with collection stats. Pass ?deep=true for subsystem checks.
+
+    The shallow response stays unauthenticated so load balancers and
+    container orchestrators can probe it. ``?deep=true`` requires a valid
+    API key: it reports the vector store endpoint, queue depths, registry
+    counts and process memory — internal topology that should not be
+    readable by anything that can merely reach the port.
+    """
     if deep:
+        await verify_api_key(request)
+
         from src.observability.health_checker import deep_health_check
         result = deep_health_check()
         return JSONResponse(content={
@@ -255,7 +304,7 @@ async def health(deep: bool = False):
             document_count=stats["document_count"],
             version=VERSION,
         )
-    except Exception as e:
+    except Exception:
         return HealthResponse(
             status="degraded",
             collection=settings.chroma_collection,
@@ -377,13 +426,14 @@ async def _stream_graph(body: AskRequest, request: Request, session_id: str | No
     output filter before leaving the server.
     """
     try:
-        from src.observability.cost_callback import CostCallbackHandler
         from src.graph.tracing import start_run_capture
+        from src.observability.cost_callback import CostCallbackHandler
 
         handler = CostCallbackHandler()
         start = time.perf_counter()
 
         import uuid
+
         from src.graph.build_graph import get_graph
 
         graph = get_graph()
@@ -542,6 +592,21 @@ async def ask_endpoint(request: Request, body: AskRequest):
     # another client's conversation history by guessing session IDs.
     scoped_session = _scoped_session_id(request, body.session_id)
 
+    # Constrain retrieval to the departments this key may read. Applied to
+    # the request body so every downstream path — sync, streaming graph
+    # and streaming naive — receives the same enforced filter, rather than
+    # each having to remember to check.
+    try:
+        body.filter = enforce_scope(body.filter, permitted_departments(request))
+    except DepartmentForbidden as e:
+        logger.warning(
+            "Blocked cross-department retrieval: key=%s requested=%s allowed=%s",
+            getattr(request.state, "api_key_id", "?"),
+            sorted(e.requested),
+            sorted(e.allowed),
+        )
+        raise HTTPException(status_code=403, detail=str(e)) from e
+
     try:
         if body.stream:
             resolved = _resolve_mode(body)
@@ -556,7 +621,7 @@ async def ask_endpoint(request: Request, body: AskRequest):
         return await asyncio.to_thread(_ask_sync, body, scoped_session)
     except Exception as e:
         logger.exception("Ask endpoint failed")
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -610,10 +675,10 @@ async def ingest_endpoint(request: Request, body: IngestRequest):
     try:
         return await asyncio.to_thread(_ingest_sync, body)
     except FileNotFoundError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.exception("Ingest endpoint failed")
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -859,15 +924,34 @@ async def upload_endpoint(
     # --- Filename sanitization ---
     try:
         safe_name = _sanitize_filename(file.filename)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid filename.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid filename.") from e
 
     # --- Extension check ---
+    from src.ingestion.loader import available_suffixes, missing_dependency
+
     suffix = Path(safe_name).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(sorted(available_suffixes()))}",
+        )
+
+    # A known type whose parser dependency is not installed. Reject it here
+    # rather than accepting the upload and dead-lettering it moments later —
+    # asynchronous failure hides the reason from the caller.
+    package = missing_dependency(suffix)
+    if package:
+        logger.error(
+            "Rejected %s upload: '%s' support requires the %s package", suffix, suffix, package
+        )
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"'{suffix}' files cannot be processed by this server: the {package} "
+                f"package is not installed. Currently accepted: "
+                f"{', '.join(sorted(available_suffixes()))}"
+            ),
         )
 
     # --- MIME type check ---
@@ -884,6 +968,22 @@ async def upload_endpoint(
         raise HTTPException(
             status_code=400,
             detail=f"Invalid department '{department}'. Allowed: {', '.join(sorted(VALID_DEPARTMENTS))}",
+        )
+
+    # A key scoped to a department must not be able to file documents into
+    # another one. Without this, write is the way around read scoping:
+    # upload into `legal`, then read it back through the legal filter.
+    allowed_departments = permitted_departments(request)
+    if allowed_departments is not None and department not in allowed_departments:
+        logger.warning(
+            "Blocked cross-department upload: key=%s department=%s allowed=%s",
+            getattr(request.state, "api_key_id", "?"),
+            department,
+            sorted(allowed_departments),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Not permitted for department(s): {department}",
         )
 
     # --- File size check ---
@@ -912,7 +1012,7 @@ async def upload_endpoint(
         return await asyncio.to_thread(_upload_sync, content, safe_name, department)
     except Exception as e:
         logger.exception("Upload endpoint failed for file: %s", safe_name)
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1066,55 @@ async def document_status_endpoint(request: Request, document_id: str):
     if record is None or not _owns_document(request, record):
         raise HTTPException(status_code=404, detail=f"Unknown document: {document_id}")
     return _to_status_response(record)
+
+
+@app.post(
+    "/documents/{document_id}/retry",
+    response_model=DocumentRetryResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    dependencies=[Depends(verify_api_key)],
+)
+@limiter.limit(settings.heavy_rate_limit)
+async def retry_document_endpoint(request: Request, response: Response, document_id: str):
+    """Requeue a failed or dead-lettered document for indexing.
+
+    The stored bytes are reused, so this recovers a document without the
+    original file being uploaded again.
+    """
+    from src.ingestion.registry import get_registry
+    from src.ingestion.replay import (
+        OUTCOME_ALREADY_PROCESSED,
+        OUTCOME_MISSING_OBJECT,
+        OUTCOME_UNKNOWN_DOCUMENT,
+        replay_document,
+    )
+
+    record = await asyncio.to_thread(get_registry().get, document_id)
+    if record is None or not _owns_document(request, record):
+        raise HTTPException(status_code=404, detail=f"Unknown document: {document_id}")
+
+    result = await asyncio.to_thread(replay_document, document_id)
+
+    if result.outcome == OUTCOME_UNKNOWN_DOCUMENT:
+        raise HTTPException(status_code=404, detail=f"Unknown document: {document_id}")
+    if result.outcome == OUTCOME_MISSING_OBJECT:
+        # The bytes are gone, so no amount of retrying will help.
+        raise HTTPException(status_code=409, detail=result.detail)
+    if result.outcome == OUTCOME_ALREADY_PROCESSED:
+        response.status_code = 200
+    elif result.requeued:
+        response.status_code = 202
+    else:
+        raise HTTPException(status_code=409, detail=result.detail)
+
+    return DocumentRetryResponse(
+        document_id=result.document_id,
+        filename=result.filename,
+        outcome=result.outcome,
+        detail=result.detail,
+        requeued=result.requeued,
+        status_url=f"/documents/{document_id}",
+    )
 
 
 @app.get(
@@ -1057,4 +1206,4 @@ async def eval_endpoint(request: Request, body: EvalRequest):
         )
     except Exception as e:
         logger.exception("Eval endpoint failed")
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e)) from e

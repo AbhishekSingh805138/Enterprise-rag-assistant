@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 
 from config import settings
-
 from src.events.bus import Event, EventBusError
 
 logger = logging.getLogger(__name__)
@@ -51,7 +50,7 @@ _INDEXES = [
 class SQLiteDelivery:
     """A claimed event, settled via ack/nack against the owning bus."""
 
-    def __init__(self, bus: "SQLiteEventBus", row_id: int, event: Event) -> None:
+    def __init__(self, bus: SQLiteEventBus, row_id: int, event: Event) -> None:
         self._bus = bus
         self._row_id = row_id
         self.event = event

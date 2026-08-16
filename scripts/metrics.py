@@ -8,8 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from config import setup_logging
 from src.observability.metrics_store import COST_BUDGET, get_store
@@ -48,12 +47,12 @@ def main() -> None:
     rows = store.query_recent(n) if n else store.query_recent(999_999)
     stats = store.summary(n)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     scope = "all queries" if args.all else f"last {args.last} queries"
 
     print()
     print("=" * 78)
-    print(f"  Query Cost & Latency Dashboard")
+    print("  Query Cost & Latency Dashboard")
     print(f"  {scope}  (as of {now})")
     print("=" * 78)
 

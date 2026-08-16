@@ -21,17 +21,20 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
-from langchain_openai import ChatOpenAI
 from pydantic import Field
 
 from config import settings
+from src.prompts import register
 from src.llm_pool import get_llm
 
 logger = logging.getLogger(__name__)
 
 NUM_VARIANTS = settings.num_query_variants
 
-_EXPAND_PROMPT = ChatPromptTemplate.from_messages(
+_EXPAND_PROMPT = register(
+    "multi_query_expand",
+    "v1",
+
     [
         (
             "system",
@@ -49,13 +52,9 @@ _EXPAND_PROMPT = ChatPromptTemplate.from_messages(
 
 def _generate_variants(question: str, n: int = NUM_VARIANTS) -> list[str]:
     """Use the LLM to generate alternative query phrasings."""
-    llm = ChatOpenAI(
-        model=settings.llm_model,
-        temperature=0.7,
-        api_key=settings.openai_api_key,
-        timeout=settings.llm_timeout,
-        max_retries=settings.llm_max_retries,
-    )
+    # Pooled, and covered by provider failover — a direct ChatOpenAI here
+    # would keep this path pinned to one vendor.
+    llm = get_llm(temperature=0.7)
     chain = _EXPAND_PROMPT | llm | StrOutputParser()
     raw = chain.invoke({"question": question, "n": n})
     variants = [line.strip() for line in raw.strip().split("\n") if line.strip()]

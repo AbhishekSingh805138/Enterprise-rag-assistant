@@ -184,6 +184,7 @@ class TestCLISmoke:
 
     def test_ask_cli_parses_all_retrievers(self):
         import argparse
+
         from scripts.ask import main
 
         # Build the parser the same way main() does
@@ -296,6 +297,7 @@ class TestConfigSmoke:
 
     def test_full_valid_config(self):
         from dataclasses import replace
+
         from config import settings
 
         good = replace(
@@ -310,6 +312,7 @@ class TestConfigSmoke:
 
     def test_chunk_overlap_gte_chunk_size_raises(self):
         from dataclasses import replace
+
         from config import settings
 
         bad = replace(settings, openai_api_key="sk-test", chunk_size=100, chunk_overlap=100)
@@ -318,6 +321,7 @@ class TestConfigSmoke:
 
     def test_negative_top_k_raises(self):
         from dataclasses import replace
+
         from config import settings
 
         bad = replace(settings, openai_api_key="sk-test", top_k=-1)
@@ -326,6 +330,7 @@ class TestConfigSmoke:
 
     def test_zero_chunk_size_raises(self):
         from dataclasses import replace
+
         from config import settings
 
         bad = replace(settings, openai_api_key="sk-test", chunk_size=0)

@@ -12,8 +12,7 @@ import json
 import logging
 import sqlite3
 import threading
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from config import settings
@@ -36,7 +35,10 @@ CREATE TABLE IF NOT EXISTS semantic_cache (
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
-    dot = sum(x * y for x, y in zip(a, b))
+    # strict: a dimension mismatch (e.g. after an embedding model change)
+    # would otherwise truncate silently and yield a plausible-looking but
+    # meaningless score, serving the wrong cached answer.
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     if norm_a == 0 or norm_b == 0:
@@ -67,10 +69,14 @@ class SemanticCache:
     def _get_embed_fn(self):
         """Lazy-load embedding function."""
         if self._embed_fn is None:
-            from langchain_openai import OpenAIEmbeddings
-            self._embed_fn = OpenAIEmbeddings(
-                model=settings.embedding_model,
-                api_key=settings.openai_api_key,
+            from src.llm.providers import build_embeddings
+
+            # Same provider as the vector store: cache entries are matched
+            # by cosine similarity, so an embedder from a different model
+            # would score every stored query as unrelated (or, worse,
+            # spuriously similar) with no error to show for it.
+            self._embed_fn = build_embeddings(
+                settings.embedding_provider, settings.embedding_model
             )
         return self._embed_fn
 
@@ -103,7 +109,7 @@ class SemanticCache:
 
         # Fetch all cached entries (for small cache sizes this is fine;
         # for large-scale use, switch to a vector index)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, query, answer, embedding, mode, strategy, created_at, ttl "
@@ -178,7 +184,7 @@ class SemanticCache:
                     json.dumps(embedding),
                     mode,
                     strategy,
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                     cache_ttl,
                     scope,
                 ),
@@ -204,7 +210,7 @@ class SemanticCache:
             ).fetchall()
 
             expired_ids = []
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(UTC)
             for row in rows:
                 try:
                     created = datetime.fromisoformat(row["created_at"])
