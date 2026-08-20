@@ -33,6 +33,38 @@ def unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
 
+@pytest.fixture(autouse=True)
+def minio_credentials(monkeypatch):
+    """Pin S3 credentials to MinIO's, ignoring the host's AWS config.
+
+    Left alone, boto3 resolves whatever the developer happens to have. On
+    a machine with an SSO/login profile configured, that chain reaches the
+    login credential provider and raises MissingDependencyException
+    (asking for ``botocore[crt]``) before a request is ever made — against
+    a MinIO endpoint that wants none of it. CI has no AWS config, so it
+    falls through to these values by accident and passes; the failure only
+    ever appears locally, which is the worst place to hide it.
+
+    Autouse rather than a fixture the S3 tests opt into: the end-to-end
+    test constructs ``S3ObjectStore()`` itself and would otherwise be the
+    one case that misses the setup.
+    """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "minioadmin")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+
+    # boto3 caches its default session on first use, so a session built
+    # before this fixture ran would keep the host's credentials for the
+    # rest of the process.
+    import boto3
+
+    boto3.DEFAULT_SESSION = None
+    yield
+    boto3.DEFAULT_SESSION = None
+
+
 # ---------------------------------------------------------------------------
 # Kafka
 # ---------------------------------------------------------------------------
@@ -196,10 +228,7 @@ def s3_store():
         s.s3_region = "us-east-1"
         s.s3_endpoint_url = S3_ENDPOINT
         s.s3_prefix = "documents"
-        import os
-
-        os.environ.setdefault("AWS_ACCESS_KEY_ID", "minioadmin")
-        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        # Credentials come from the autouse `minio_credentials` fixture.
         yield S3ObjectStore()
 
 
@@ -288,6 +317,12 @@ class TestPipelineOnProductionBackends:
             rs.ingest_visibility_timeout_s = 300
             ws.ingest_max_attempts, ws.ingest_retry_backoff_s = 3, 0.0
             ws.worker_batch_size, ws.worker_poll_interval_s = 1, 0.1
+            # Patched settings are a MagicMock, so every attribute the
+            # worker reads has to be stubbed with a real value — an
+            # unstubbed one arrives as a MagicMock and fails the first
+            # comparison against an int, which is how this test broke when
+            # WORKER_CONCURRENCY was introduced.
+            ws.worker_concurrency = 1
 
             store = S3ObjectStore()
             bus = KafkaEventBus(bootstrap_servers=KAFKA_BOOTSTRAP)
