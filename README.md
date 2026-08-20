@@ -961,7 +961,7 @@ real server:
 
 ```bash
 # terminal 1 — vector store
-chroma run --path ./chroma_server --port 8001
+chroma run --path ./chroma_server --port 8001 --host 127.0.0.1
 
 # terminal 2 — API
 ASYNC_INGESTION=true CHROMA_MODE=server CHROMA_PORT=8001 \
@@ -971,6 +971,14 @@ ASYNC_INGESTION=true CHROMA_MODE=server CHROMA_PORT=8001 \
 ASYNC_INGESTION=true CHROMA_MODE=server CHROMA_PORT=8001 \
   python -m scripts.worker
 ```
+
+`--host` is not optional on Windows. Chroma defaults to `--host localhost`,
+which resolves to the IPv6 loopback `::1`, so the server binds IPv6 only.
+`CHROMA_HOST` defaults to `localhost` too, so the two agree by coincidence
+— until someone sets `CHROMA_HOST=127.0.0.1`, which is IPv4. Nothing is
+listening there, and the client reports `Could not connect to a Chroma
+server. Are you sure it is running?` while `netstat` plainly shows the port
+bound. Pin both to the same address family and the ambiguity is gone.
 
 ```bash
 curl -X POST http://localhost:8000/upload \
@@ -1059,7 +1067,7 @@ behind. Copy it across — stored embeddings are reused, so this costs nothing
 in API spend and the vectors are identical:
 
 ```bash
-chroma run --path ./chroma_server --port 8001      # target must be running
+chroma run --path ./chroma_server --port 8001 --host 127.0.0.1   # must be running
 
 python -m scripts.migrate_chroma --dry-run          # preview
 python -m scripts.migrate_chroma                    # copy
