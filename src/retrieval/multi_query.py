@@ -19,13 +19,13 @@ import logging
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
 from pydantic import Field
 
 from config import settings
-from src.prompts import register
 from src.llm_pool import get_llm
+from src.observability.cost_guard import allow as cost_allows
+from src.prompts import register
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +82,15 @@ class MultiQueryRetriever(BaseRetriever):
         """Retrieve via multi-query expansion + deduplication."""
         logger.info("Multi-query retrieval: %s", query[:120])
 
-        # Generate variants
-        try:
-            variants = _generate_variants(query)
-        except Exception:
-            logger.exception("Query expansion failed — falling back to single query")
-            variants = []
+        # Generate variants. Expansion is an optional recall improvement,
+        # so it is one of the first things to drop when the per-query
+        # budget is spent — the original query still runs.
+        variants: list[str] = []
+        if cost_allows("multi-query expansion"):
+            try:
+                variants = _generate_variants(query)
+            except Exception:
+                logger.exception("Query expansion failed — falling back to single query")
 
         # Include the original query
         all_queries = [query] + variants

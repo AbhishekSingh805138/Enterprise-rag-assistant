@@ -16,6 +16,13 @@ from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_core.documents import Document
 
+# Documents in these folders are marked confidential; everything else
+# is internal. Shared with the retrieval scoping rules so
+# "confidential" means the same thing at write time and at read time.
+from src.security.access_control import (
+    CONFIDENTIAL_DEPARTMENTS as _CONFIDENTIAL_DEPARTMENTS,
+)
+
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".csv", ".txt", ".md"}
@@ -92,10 +99,6 @@ def _load_csv(path: Path) -> list[Document]:
 
     return CSVLoader(str(path), encoding="utf-8").load()
 
-# Documents in these folders are marked confidential; everything else is
-# internal. Shared with the retrieval scoping rules so "confidential"
-# means the same thing at write time and at read time.
-from src.security.access_control import CONFIDENTIAL_DEPARTMENTS as _CONFIDENTIAL_DEPARTMENTS
 
 
 def _infer_department(file_path: Path, root: Path) -> str:

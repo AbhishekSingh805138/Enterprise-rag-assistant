@@ -336,6 +336,7 @@ class TestDepartmentBinding:
             ws.ingest_max_attempts = 3
             ws.ingest_retry_backoff_s = 0.0
             ws.worker_batch_size = 1
+            ws.worker_concurrency = 1
             ws.worker_poll_interval_s = 0.01
             worker.poll_once()
 
@@ -429,6 +430,7 @@ class TestEndToEnd:
             worker_settings.ingest_max_attempts = 3
             worker_settings.ingest_retry_backoff_s = 0.0
             worker_settings.worker_batch_size = 1
+            worker_settings.worker_concurrency = 1
             worker_settings.worker_poll_interval_s = 0.01
             assert worker.poll_once() == [OUTCOME_PROCESSED]
 

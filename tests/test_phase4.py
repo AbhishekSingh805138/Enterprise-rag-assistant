@@ -222,7 +222,7 @@ class TestGraphIntegration:
     @patch("src.graph.nodes._llm")
     def test_relevant_path_with_critic(
         self, mock_llm_factory, mock_grade_prompt, mock_gen_prompt,
-        mock_critic_prompt, mock_get_retriever,
+        mock_critic_prompt, mock_get_retriever, stub_llm,
     ):
         """Test: retrieve → grade (relevant) → generate → critic → END."""
         from langgraph.checkpoint.memory import InMemorySaver
@@ -277,7 +277,7 @@ class TestGraphIntegration:
     @patch("src.graph.nodes._llm")
     def test_retry_path_with_critic(
         self, mock_llm_factory, mock_rewrite_prompt, mock_grade_prompt,
-        mock_gen_prompt, mock_critic_prompt, mock_get_retriever,
+        mock_gen_prompt, mock_critic_prompt, mock_get_retriever, stub_llm,
     ):
         """Test: retrieve → grade (not relevant) → rewrite → retrieve → grade (relevant) → generate → critic."""
         from langgraph.checkpoint.memory import InMemorySaver

@@ -14,7 +14,6 @@ Phase 8 additions:
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +21,7 @@ from typing import Protocol, runtime_checkable
 
 from config import settings
 from src.observability.cost_callback import QueryMetrics
+from src.storage.sql import SqlDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class MetricsStoreProtocol(Protocol):
     def grader_rejection_rate(self, n: int | None = None) -> float: ...
     def latency_percentiles(self, n: int | None = None) -> dict: ...
     def cost_alert_check(self, threshold: float | None = None) -> list[dict]: ...
+    def spend_today(self) -> float: ...
     def close(self) -> None: ...
 
 _CREATE_TABLE = """\
@@ -77,13 +78,33 @@ _MIGRATIONS = [
 COST_BUDGET = settings.cost_budget_per_query
 
 
+def _prompt_version() -> str:
+    """Fingerprint of the active prompt set, or "" if unavailable.
+
+    Imported lazily and defensively: metrics recording must never be the
+    thing that fails a query.
+    """
+    try:
+        from src.prompts import prompt_fingerprint
+
+        return prompt_fingerprint()
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
 class MetricsStore:
-    """Thin wrapper around a SQLite table for query metrics."""
+    """Query metrics, on SQLite or on PostgreSQL when DATABASE_URL is set.
+
+    Shared storage matters here for a subtler reason than the registry's:
+    the Prometheus exporter reads its aggregates from this table, so with
+    per-replica files each replica reports only the queries it happened
+    to serve — and the dashboards quietly show a fraction of the traffic.
+    """
 
     def __init__(self, db_path: str) -> None:
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
+        self._db = SqlDatabase(db_path)
+        self._conn = self._db
+        self._lock = self._db.lock
         self._conn.execute(_CREATE_TABLE)
         self._conn.commit()
         self._run_migrations()
@@ -94,7 +115,11 @@ class MetricsStore:
             try:
                 self._conn.execute(sql)
                 self._conn.commit()
-            except sqlite3.OperationalError as e:
+            except Exception as e:
+                # Widened from sqlite3.OperationalError: Postgres raises
+                # DuplicateColumn, and leaves the transaction aborted
+                # until it is rolled back.
+                self._db.rollback()
                 if "duplicate column" not in str(e).lower():
                     logger.debug("Migration skipped: %s", e)
 
@@ -119,6 +144,7 @@ class MetricsStore:
                     m.latency_ms,
                     1 if m.is_idk else 0,
                     m.grader_rejected,
+                    _prompt_version(),
                 ),
             )
             self._conn.commit()
@@ -139,6 +165,22 @@ class MetricsStore:
                 "SELECT * FROM query_metrics ORDER BY id DESC LIMIT ?", (n,)
             )
             return [dict(row) for row in cur.fetchall()]
+
+    def spend_today(self) -> float:
+        """Total recorded cost for the current UTC day.
+
+        Backs the daily cap. Uses a prefix match on the ISO timestamp
+        rather than date arithmetic so it stays a plain index-friendly
+        range scan on the text column that already exists.
+        """
+        today = datetime.now(UTC).date().isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM query_metrics "
+                "WHERE ts >= ?",
+                (today,),
+            ).fetchone()
+        return float(row["total"]) if row else 0.0
 
     def summary(self, n: int | None = None) -> dict:
         """Aggregate statistics over the last *n* queries (or all if None)."""

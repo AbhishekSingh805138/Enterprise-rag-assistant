@@ -88,7 +88,7 @@ class TestSafeErrorDetail:
 class TestUploadPathTraversal:
     """Verify path traversal attacks are blocked."""
 
-    def test_directory_traversal_stripped(self, client):
+    def test_directory_traversal_stripped(self, client, stub_llm):
         """Filenames with ../ components are sanitized to basename only."""
         file = io.BytesIO(b"hello")
         # ../../etc/passwd.txt → passwd.txt (safe)

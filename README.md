@@ -1203,6 +1203,26 @@ curl -X POST http://localhost:8000/ask \
 
 Set valid keys via `API_KEYS` environment variable (comma-separated).
 
+### Department scoping (retrieval RBAC)
+
+A key can be restricted to the departments it may read from and upload
+into:
+
+```bash
+API_KEYS=<admin-key>:*,<hr-key>:hr|general,<legal-key>:legal|general
+```
+
+A scoped key that asks for another department gets `403`. More
+importantly, a scoped key that asks with *no* filter is narrowed to its
+own departments rather than searching the whole corpus — an unfiltered
+question previously swept every department, so confidential material
+could reach an answer without anyone asking for it.
+
+A key with no `:scope` suffix reads every department, which is the
+historical behaviour and keeps existing deployments working. The API
+logs a warning at startup naming how many keys are unscoped, so a
+deployment that believes it is segmented can see that it is not.
+
 ### Input Guardrails
 
 The system detects and rejects:
@@ -1213,6 +1233,39 @@ The system detects and rejects:
 ### Output Filtering
 
 All LLM responses pass through PII redaction before reaching the client. Detected patterns (SSN, credit card, phone) are replaced with `[REDACTED]`.
+
+Email addresses are deliberately **not** redacted in answers: enterprise
+answers are routinely "contact facilities@company.com", and removing the
+one actionable detail makes the answer useless.
+
+### PII at ingest
+
+Answer-time redaction protects the response and nothing else — the
+document text is embedded verbatim, so the vector store and every backup
+of it hold the original. `INGEST_PII_MODE` addresses that:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` (default) | Unchanged — indexing behaviour is untouched |
+| `warn` | Logs what the corpus contains, indexes it anyway |
+| `redact` | Strips PII (including email) before embedding |
+
+`redact` is not the default because it changes what is retrievable, and a
+corpus indexed before and after would be inconsistent. That is a decision
+for whoever owns the data.
+
+### Parsing untrusted files
+
+PDF and DOCX parsers are a long-standing exploit surface, and the worker
+runs them on user-supplied bytes. Bounded by `INGEST_PARSE_TIMEOUT_S`
+(a pathological file must not stall the queue behind it) and
+`INGEST_MAX_EXTRACTED_CHARS` (a small upload that expands into gigabytes
+of text). Both are treated as permanent failures and dead-letter
+immediately rather than spending the retry budget on the same outcome.
+
+In `docker-compose.prod.yml` the api and worker containers additionally
+run read-only, with all capabilities dropped, `no-new-privileges`, and a
+`noexec,nosuid` tmpfs for the temp directory the upload is written to.
 
 ### Security Best Practices
 
@@ -1243,6 +1296,55 @@ View metrics via CLI:
 ```bash
 python -m scripts.metrics --last 20
 ```
+
+### Prometheus
+
+`GET /metrics` exposes the same numbers in Prometheus format — cost,
+latency percentiles, IDK rate, grader rejection rate, queue and
+dead-letter depth, documents by status — plus a `rag_build_info` series
+whose labels carry the active prompt-set fingerprint and model names, so
+a change in quality can be attributed to the deploy that caused it.
+
+Authenticated for the same reason `?deep=true` is: the body carries queue
+depths and per-department document counts.
+
+```bash
+curl -H "Authorization: Bearer $RAG_API_KEY" http://localhost:8000/metrics
+```
+
+Scrape config and alert rules are in `deploy/prometheus/`. The alerts
+that matter most here are RAG-specific: a non-zero dead-letter queue
+(documents accepted and never indexed) and an IDK-rate spike (retrieval
+broke, not the model).
+
+### Tracing
+
+With `OTEL_ENABLED=true`, the trace context travels *inside the ingestion
+event*, so an upload and the indexing that happens minutes later in the
+worker process form a single trace. With it off, the OpenTelemetry SDK is
+never imported.
+
+### Prompt versioning
+
+Every prompt is registered with a version and a content hash. The
+fingerprint of the whole set is recorded on each query metric
+(`prompt_version`), which is what makes a quality regression attributable
+rather than merely observed. `PROMPT_OVERRIDE_DIR` allows changing
+wording without a code change; an override that does not declare the same
+template variables as the built-in is rejected — a prompt that quietly
+lost `{context}` would still produce fluent, ungrounded answers.
+
+### Quality regression gate
+
+```bash
+python -m scripts.ragas_gate --mode graph --retriever hybrid
+```
+
+Fails on an absolute floor or a drop from the recorded baseline beyond
+tolerance. Runs nightly (`.github/workflows/ragas-nightly.yml`), never on
+pull requests — it spends real tokens and its scores are
+non-deterministic, so gating PRs on it would produce flaky failures that
+people learn to re-run until green.
 
 ### Health Checks
 

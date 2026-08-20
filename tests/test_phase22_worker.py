@@ -48,6 +48,7 @@ def _worker_settings():
         ws.ingest_max_attempts = 3
         ws.ingest_retry_backoff_s = 0.0
         ws.worker_batch_size = 1
+        ws.worker_concurrency = 1  # sequential, so outcome order is stable
         ws.worker_poll_interval_s = 0.01
         bs.ingest_visibility_timeout_s = 300
         rs.ingest_visibility_timeout_s = 300

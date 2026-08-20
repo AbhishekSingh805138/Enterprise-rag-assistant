@@ -52,6 +52,12 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
     settings.validate()
 
+    # Named separately from the API so spans on both sides of the queue
+    # are attributable to the process that produced them.
+    from src.observability import tracing_otel as otel
+
+    otel.setup_tracing("rag-worker")
+
     from src.ingestion.worker import IngestionWorker
 
     worker = IngestionWorker(

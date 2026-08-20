@@ -22,8 +22,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   docker run --rm -v "$PWD:/w" -w /w python:3.11-slim sh -c \
 #     "pip install uv && uv pip compile requirements.txt \
 #      --generate-hashes --output-file requirements.lock"
+#
+# --retries/--timeout: the dependency set includes several very large
+# wheels (torch alone is ~800MB), and a dropped connection part-way
+# through one of them fails the whole build. Without these a transient
+# blip is indistinguishable from a real dependency problem, and CI
+# becomes a coin flip on network conditions.
 COPY requirements.txt requirements.lock ./
-RUN pip install --no-cache-dir --prefix=/install --require-hashes -r requirements.lock
+RUN pip install --no-cache-dir --prefix=/install --require-hashes \
+        --retries 5 --timeout 120 -r requirements.lock
 
 # Stage 2: Production image
 FROM python:3.11-slim

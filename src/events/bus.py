@@ -27,9 +27,49 @@ logger = logging.getLogger(__name__)
 # awaiting indexing.
 DOCUMENT_UPLOADED = "document.uploaded"
 
+# Envelope schema version.
+#
+# A rolling deploy runs two versions of the worker against one queue, and
+# events published by the new API are consumed by old workers for as long
+# as the rollout takes. Without a version on the wire there is no way to
+# tell "a field I do not understand" from "a field that should have been
+# there", so the only safe reaction to any change is to guess.
+#
+# The contract:
+#   * Same MAJOR  -> compatible. Unknown fields are ignored, so adding an
+#                    optional field needs no coordination.
+#   * Higher MAJOR than this consumer knows -> refuse, and dead-letter
+#                    rather than process an envelope whose meaning may
+#                    have changed. Half-processing is worse than waiting.
+#   * Missing version -> treat as 1.0, which is what every event
+#                    published before this field existed actually is.
+SCHEMA_VERSION = "1.0"
+SCHEMA_MAJOR = 1
+LEGACY_SCHEMA_VERSION = "1.0"
+
 
 class EventBusError(RuntimeError):
     """Raised when publishing or consuming fails."""
+
+
+class IncompatibleSchemaError(EventBusError):
+    """Event envelope is a major version this consumer cannot interpret."""
+
+    def __init__(self, found: str):
+        self.found = found
+        super().__init__(
+            f"Event schema {found!r} is newer than this consumer understands "
+            f"(supports major version {SCHEMA_MAJOR}). Upgrade the worker, or "
+            f"roll back the publisher."
+        )
+
+
+def _schema_major(version: str) -> int:
+    """Major component of a schema version; 1 for anything unparseable."""
+    try:
+        return int(str(version).split(".", 1)[0])
+    except (ValueError, TypeError):
+        return SCHEMA_MAJOR
 
 
 def _utc_now_iso() -> str:
@@ -52,10 +92,12 @@ class Event:
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     published_at: str = field(default_factory=_utc_now_iso)
     request_id: str = ""
+    schema_version: str = SCHEMA_VERSION
 
     def to_json(self) -> str:
         return json.dumps(
             {
+                "schema_version": self.schema_version,
                 "event_id": self.event_id,
                 "event_type": self.event_type,
                 "document_id": self.document_id,
@@ -76,6 +118,17 @@ class Event:
             raise EventBusError(f"Malformed event payload: {e}") from e
         if not isinstance(data, dict):
             raise EventBusError("Event payload must be a JSON object")
+
+        # Absent means this event predates the field, which makes it 1.0
+        # by definition — every envelope ever published without one has
+        # exactly the 1.0 shape.
+        version = str(data.get("schema_version") or LEGACY_SCHEMA_VERSION)
+        if _schema_major(version) > SCHEMA_MAJOR:
+            # Deliberately not "ignore the parts we don't know": at a
+            # major bump a field's *meaning* may have changed, so an
+            # optimistic read could index the wrong thing silently.
+            raise IncompatibleSchemaError(version)
+
         try:
             return cls(
                 event_type=data["event_type"],
@@ -85,6 +138,7 @@ class Event:
                 event_id=data.get("event_id") or uuid.uuid4().hex,
                 published_at=data.get("published_at") or _utc_now_iso(),
                 request_id=data.get("request_id") or "",
+                schema_version=version,
             )
         except (KeyError, TypeError, ValueError) as e:
             raise EventBusError(f"Event is missing required fields: {e}") from e
@@ -99,6 +153,10 @@ class Event:
             event_id=self.event_id,  # stable across retries for tracing
             published_at=_utc_now_iso(),
             request_id=self.request_id,
+            # Republish at the version it arrived as, not this build's.
+            # Rewriting it would let a retry silently upgrade an envelope
+            # the original publisher never wrote.
+            schema_version=self.schema_version,
         )
 
 

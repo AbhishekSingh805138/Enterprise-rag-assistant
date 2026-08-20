@@ -6,9 +6,9 @@ import logging
 from pydantic import BaseModel, Field
 
 from config import settings
-from src.prompts import register
 from src.knowledge_graph.models import Triple
 from src.llm_pool import get_llm
+from src.prompts import register
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,6 @@ def extract_triples(text: str, source_doc: str = "") -> list[Triple]:
         return []
 
     try:
-        from langchain_core.prompts import ChatPromptTemplate
 
         prompt = register(
             "kg_extract_entities",

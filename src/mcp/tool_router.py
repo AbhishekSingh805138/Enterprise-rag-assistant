@@ -9,9 +9,9 @@ from __future__ import annotations
 import logging
 
 from config import settings
-from src.prompts import register
 from src.llm_pool import get_llm
 from src.mcp.tool_registry import get_tool_registry
+from src.prompts import register
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,6 @@ def mcp_route_and_invoke(question: str) -> list[str]:
 
     # Ask the LLM which tools to use
     try:
-        from langchain_core.prompts import ChatPromptTemplate
         from pydantic import BaseModel, Field
 
         class ToolSelection(BaseModel):

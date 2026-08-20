@@ -569,16 +569,100 @@ offset ports, and validates all three compose files on every push.
 
 ---
 
+### 2.9 Operability and spend control (Phase 27)
+
+The system by this point was correct and hardened, but it could not be
+*run*: everything it measured landed in a SQLite table readable only by a
+CLI, nothing paged anyone, no ceiling existed on what a query could spend,
+and several controls that looked like policy were only ever advisory.
+
+**Spend was measured, never enforced.** `COST_BUDGET_PER_QUERY` existed
+solely to put an asterisk beside expensive rows in a report. A multi-part
+question could decompose into sub-questions, each running a full
+retrieve/grade/generate/critique cycle, with no ceiling and no daily cap
+behind it. `src/observability/cost_guard.py` now enforces two ceilings
+with deliberately different characters: the per-query budget **degrades**
+(past it the pipeline stops elaborating — no more sub-questions, no query
+expansion, no LLM rerank, no critic — and answers with what it has,
+because turning a cost control into an availability problem serves nobody),
+while the daily cap **denies** with `503` plus a `Retry-After` to the next
+UTC midnight, since stopping runaway spend is its entire purpose.
+
+The daily cap covers `/eval` as well as `/ask`. Skipping it there would
+have left the ceiling off the single most expensive operation the service
+performs — a full RAGAS run generates an answer per item and then scores
+each with four LLM-judged metrics. The judge's own calls are costed too:
+they bypass `ask()`/`answer()`, so without an explicit
+`CostCallbackHandler` the larger half of a run's spend reached no store
+and counted toward no cap. They are recorded as `mode="eval"` so a run
+registers against the day's budget without reading as a spike in user
+query volume.
+
+**Monitoring vs. record-keeping.** `GET /metrics` renders the existing
+numbers in Prometheus exposition format — cost, latency percentiles, IDK
+rate, grader rejection rate, queue and dead-letter depth, documents by
+status — plus a `rag_build_info` series whose labels carry the prompt-set
+fingerprint and model names, so a quality change is attributable to the
+deploy that caused it. Written by hand rather than with
+`prometheus_client`: the values are aggregates over a SQLite table, not
+in-process counters, and a second registry could disagree with the CLI and
+the health check. The endpoint is authenticated for the same reason
+`?deep=true` is — the body carries queue depths and per-department
+document counts. Alert rules in `deploy/prometheus/` target the failure
+modes specific to this system: a non-zero DLQ (documents accepted and
+never indexed) and an IDK-rate spike (retrieval broke, not the model).
+
+**Traces that survive the queue.** The request id already correlated log
+lines, but it could not show where time went across a process boundary.
+With `OTEL_ENABLED=true` the trace context rides *inside the ingestion
+event payload* — indexing happens in another process, possibly minutes
+later, so the event is the only carrier available, and without it the
+upload span and the indexing span are two unrelated traces. With it off,
+the OpenTelemetry SDK is never imported.
+
+| Concern | Before | Now |
+|---------|--------|-----|
+| Query spend | Advisory constant in a CLI report | Enforced ceiling that degrades the pipeline (`src/observability/cost_guard.py`) |
+| Daily spend | Nothing | `COST_DAILY_CAP_USD` → `503` + `Retry-After` on `/ask` and `/eval`; RAGAS judge calls recorded as `mode="eval"` so they count toward it |
+| Metrics | SQLite table, CLI only | Authenticated `GET /metrics` + alert rules (`src/observability/prometheus.py`, `deploy/prometheus/`) |
+| Tracing | Request id per process | Context propagated through the event payload (`src/observability/tracing_otel.py`) |
+| Prompts | Inline strings | Versioned + content-hashed; fingerprint recorded on every query metric; `PROMPT_OVERRIDE_DIR` validated against declared template variables (`src/prompts/`) |
+| Quality | `ragas_eval` printed PASS/FAIL, exited 0 | `scripts/ragas_gate.py` fails on an absolute floor or a drop from baseline; nightly only |
+| Upload admission | Accepted regardless of backlog | Refused before the bytes are stored (`src/ingestion/backpressure.py`) |
+| Untrusted parsing | Unbounded, in-process | Time + extracted-size bounds, dead-lettered immediately (`src/ingestion/safety.py`) |
+| PII | Redacted at answer time only | `INGEST_PII_MODE` scans or redacts before embedding (`src/security/pii.py`) |
+| Cache lookup | Full scan of every entry in scope | Random-hyperplane LSH prunes; exact cosine still decides (`src/cache/lsh.py`) |
+| Sparse index refresh | Rebuilt on the unlucky next request | Stale-while-revalidate, one background rebuild at a time (`src/retrieval/hybrid.py`) |
+| Stateful stores | SQLite only | `DATABASE_URL` switches all six to PostgreSQL (`src/storage/sql.py`) |
+
+Two judgement calls worth recording, because both are defaults that could
+reasonably have gone the other way:
+
+* **`INGEST_PII_MODE=off` by default.** Redaction changes what is
+  retrievable, and a corpus indexed before and after the switch would be
+  inconsistent. Whoever owns the data should make that call, not the
+  framework silently on their behalf.
+* **Email is not redacted in answers** (it *is* under ingest `redact`).
+  Enterprise answers are routinely "contact facilities@company.com";
+  stripping the one actionable detail makes the answer useless. Nobody
+  reads a vector, so at ingest there is no usefulness to trade away.
+
+The RAGAS gate runs nightly and never on pull requests: it spends real
+tokens and its scores are non-deterministic, so gating PRs on it would
+produce flaky failures that people learn to re-run until green.
+
+---
+
 ## 3. Production Gap Analysis
 
 ### Critical Gaps
 
 | Gap | Impact | Effort | Status |
 |-----|--------|--------|--------|
-| No horizontal scaling (single-process) | Cannot handle >50 concurrent users | High | Partly closed — ingestion workers scale out; query pods still need shared Redis/Postgres |
-| SQLite for all stores (not suitable for concurrent writes) | Write contention under load | High | Open (registry/queue use WAL, which is adequate for a single node) |
-| No request tracing (X-Request-ID) | Cannot debug distributed issues | Low | **Closed** — request-id middleware + `JSON_LOGS` |
-| Cost budget not enforced (only logged) | Runaway costs on expensive queries | Medium | Open |
+| No horizontal scaling (single-process) | Cannot handle >50 concurrent users | High | Partly closed — ingestion workers scale out; rate limits share Redis; stores share Postgres via `DATABASE_URL`. `warn_if_single_node()` says plainly when they do not |
+| SQLite for all stores (not suitable for concurrent writes) | Write contention under load | High | **Closed** — `DATABASE_URL` switches all six stores to PostgreSQL (§2.9); SQLite remains the single-node default |
+| No request tracing (X-Request-ID) | Cannot debug distributed issues | Low | **Closed** — request-id middleware + `JSON_LOGS`; OTEL spans propagate through the ingestion queue (§2.9) |
+| Cost budget not enforced (only logged) | Runaway costs on expensive queries | Medium | **Closed** — per-query degradation + `COST_DAILY_CAP_USD` on both `/ask` and `/eval` (§2.9). Embedding spend is still uncounted (embeddings don't fire `on_llm_end`) |
 
 ### Recommended Gaps (Medium Priority)
 
@@ -586,9 +670,13 @@ offset ports, and validates all three compose files on every push.
 |-----|--------|--------|--------|
 | No retry with exponential backoff on LLM calls | Transient failures not recovered | Low | Closed for ingestion; query path still relies on the circuit breaker |
 | No structured logging (JSON) | Hard to parse in log aggregators | Low | **Closed** — `JSON_LOGS=true` |
-| No Prometheus metrics export | No dashboarding or alerting | Medium | Open (`/health?deep=true` exposes queue/DLQ depth in the meantime) |
+| No Prometheus metrics export | No dashboarding or alerting | Medium | **Closed** — authenticated `GET /metrics` + scrape config and alert rules in `deploy/prometheus/` (§2.9) |
 | No document versioning | Can't track what changed when | Medium | Partly closed — every document has a checksum, storage key and audit timestamps |
-| No A/B testing framework | Can't compare retrieval strategies in production | Medium | Open |
+| No A/B testing framework | Can't compare retrieval strategies in production | Medium | Open — `scripts/ragas_gate.py` catches regressions between deploys, but not concurrent variants under live traffic |
+| No quality regression gate | Retrieval and prompt changes shipped unmeasured | Medium | **Closed** — nightly `scripts/ragas_gate.py` fails on an absolute floor or a drop from baseline (§2.9) |
+| Prompt changes not attributable | A quality drop could be observed but not traced to a deploy | Medium | **Closed** — versioned, content-hashed prompts; fingerprint on every query metric (§2.9) |
+| No backpressure on ingestion | `202 Accepted` issued for work hours deep in a backlog | Medium | **Closed** — `INGEST_MAX_QUEUE_DEPTH`, refused before the bytes are stored (§2.9) |
+| PII embedded verbatim into the vector store | Answer-time redaction protects the response only; vectors and their backups keep the original | Medium | **Closed (opt-in)** — `INGEST_PII_MODE=warn\|redact`; `off` by default because redaction changes what is retrievable (§2.9) |
 
 ---
 

@@ -47,3 +47,7 @@ class RAGState(TypedDict, total=False):
     # Phase 17: guardrails
     guardrail_passed: bool      # whether query passed safety checks
     guardrail_reason: str       # reason for rejection (if any)
+    # Cost ceiling: set when the per-query budget stopped decomposition
+    # early, so synthesis can say the answer is partial rather than
+    # presenting a truncated one as complete.
+    budget_truncated: bool

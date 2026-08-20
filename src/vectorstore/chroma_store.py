@@ -21,8 +21,8 @@ from datetime import UTC
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_core.embeddings import Embeddings
+from langchain_core.vectorstores import VectorStoreRetriever
 
 from config import settings
 from src.llm.providers import build_embeddings, embedding_fingerprint

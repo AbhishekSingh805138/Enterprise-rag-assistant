@@ -23,7 +23,11 @@ import time
 from pathlib import Path
 
 from config import settings
-from src.events.bus import Event, EventBusError
+from src.events.bus import Event, EventBusError, IncompatibleSchemaError
+
+# How long to hide an event this worker is too old to read, so it does not
+# spin on it while the rest of the rollout completes.
+_SCHEMA_RETRY_DELAY_S = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +158,22 @@ class SQLiteEventBus:
                         continue
                     try:
                         event = Event.from_json(row["body"])
+                    except IncompatibleSchemaError as e:
+                        # A newer publisher during a rolling deploy. The
+                        # event is valid — this worker is simply too old
+                        # to read it — so it must NOT be discarded like a
+                        # malformed one. Release it and let an upgraded
+                        # worker pick it up.
+                        logger.error(
+                            "Leaving event row id=%s on topic=%s for an upgraded "
+                            "worker: %s", row["id"], topic, e,
+                        )
+                        self._conn.execute(
+                            "UPDATE events SET status = 'pending', available_at = ?, "
+                            "locked_until = 0 WHERE id = ?",
+                            (now + _SCHEMA_RETRY_DELAY_S, row["id"]),
+                        )
+                        continue
                     except EventBusError:
                         # Undecodable payload will never succeed; drop it here
                         # rather than let it cycle through the retry budget.

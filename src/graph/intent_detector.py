@@ -16,13 +16,12 @@ from __future__ import annotations
 import logging
 import re
 
-from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from config import settings
-from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
+from src.prompts import register
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 
 logger = logging.getLogger(__name__)

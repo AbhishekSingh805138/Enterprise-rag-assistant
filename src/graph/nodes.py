@@ -20,9 +20,10 @@ from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field
 
 from config import settings
-from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
+from src.observability.cost_guard import allow as cost_allows
+from src.prompts import register
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 from src.retrieval import get_retriever
 
@@ -563,6 +564,13 @@ def critic(state: dict) -> dict:
     # Critic mode gating: verification costs 1-2 extra LLM round-trips.
     mode = settings.critic_mode.lower()
     if mode == "off":
+        return {"critic_passed": True, "claims_removed": 0}
+
+    # Verification is the last thing to drop, not the first: it is the
+    # hallucination control. But an answer that is delivered unverified
+    # still beats a query that blows through its ceiling, and the skip is
+    # recorded rather than silent.
+    if not cost_allows("critic verification"):
         return {"critic_passed": True, "claims_removed": 0}
     if mode == "adaptive":
         # Skip only low-risk answers: the grader vouched for the context,

@@ -67,9 +67,14 @@ def fake_ragas(monkeypatch):
         def __init__(self, scores):
             self._repr_dict = scores
 
-    def _evaluate(dataset, metrics=None):
+    def _evaluate(dataset, metrics=None, callbacks=None, **kwargs):
+        # `callbacks` mirrors the real ragas signature. The harness passes a
+        # CostCallbackHandler through it so the judge's own LLM spend is
+        # recorded; a stub that rejected the argument would fail on a call
+        # the real library accepts.
         captured["dataset"] = dataset
         captured["metrics"] = metrics
+        captured["callbacks"] = callbacks
         return Result({
             "faithfulness": 0.812345,
             "answer_relevancy": 0.7654,

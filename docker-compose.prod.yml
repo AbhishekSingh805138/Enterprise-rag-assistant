@@ -29,6 +29,8 @@ x-ingestion-env: &ingestion-env
   # replica keeps its own counters, so N replicas allow N x the limit.
   RATE_LIMIT_STORAGE_URI: redis://redis:6379/0
   REDIS_URL: redis://redis:6379/1
+  # Registry, conversation memory, metrics and semantic cache.
+  DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-rag}
 
 services:
   api:
@@ -58,7 +60,18 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+    # The API also parses uploads when ASYNC_INGESTION=false, and handles
+    # untrusted request bodies either way.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -94,10 +107,25 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     # Give an in-flight document time to finish before SIGKILL; the worker
     # stops claiming new events as soon as it sees SIGTERM.
     stop_grace_period: 60s
+    # This container parses PDFs and DOCX files that arrived from users,
+    # in-process, using libraries with a long history of memory-safety
+    # bugs. Code-level limits bound how much one document may consume;
+    # these bound what a successful exploit would reach.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      # Parsing materialises the file under a temp directory; noexec and
+      # nosuid mean a dropped payload cannot be executed from it.
+      - /tmp:rw,noexec,nosuid,size=512m
     deploy:
       resources:
         limits:
@@ -160,6 +188,28 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 5
+
+  # The document registry, conversation memory, query metrics and the
+  # semantic cache. Without this each replica keeps its own SQLite file:
+  # documents index twice, conversations lose their history when a
+  # follow-up lands on another replica, and the metrics dashboards show
+  # whatever fraction of traffic one replica happened to serve.
+  postgres:
+    image: postgres:16-alpine
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   # Shared state for anything that must be consistent across API replicas:
   # rate limit counters today, the semantic cache when REDIS_URL is set.
@@ -263,4 +313,6 @@ volumes:
   kafka_data:
     driver: local
   redis_data:
+    driver: local
+  postgres_data:
     driver: local

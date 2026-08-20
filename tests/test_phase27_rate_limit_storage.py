@@ -20,7 +20,6 @@ from limits import parse
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 
-
 # ---------------------------------------------------------------------------
 # Storage selection
 # ---------------------------------------------------------------------------
@@ -221,6 +220,120 @@ class TestStartupProbe:
         import api.rate_limit as rl
 
         assert rl._redact(uri) == expected
+
+
+# ---------------------------------------------------------------------------
+# The limiter's own code path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.rate_limited
+class TestLimiterRunsOnRealRequests:
+    """With the limiter ENABLED — the path the autouse fixture hides.
+
+    ``headers_enabled=True`` makes slowapi write X-RateLimit-* into an
+    injected ``response`` parameter, and raise if the endpoint does not
+    declare one. Every rate-limited endpoint returned 500 until three of
+    them gained that parameter, and 1,600 passing tests said nothing
+    because the limiter was disabled in all of them.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        s = MagicMock()
+        s.validate = MagicMock()
+        s.auth_enabled = False
+        s.chroma_collection = "c"
+        s.log_level = "WARNING"
+        s.debug_mode = False
+        s.max_upload_size_mb = 10
+        s.cors_origins = "http://localhost:8501"
+        s.cors_allow_methods = "GET,POST,OPTIONS"
+        s.cors_allow_headers = "Content-Type"
+        s.async_ingestion = False
+        s.guardrails_enabled = False
+        s.rate_limit_storage_uri = ""
+        s.rate_limit_per_minute = "100/minute"
+        s.heavy_rate_limit = "100/minute"
+        with patch("api.app.settings", s), patch("src.security.auth.settings", s):
+            from api.app import app
+
+            with TestClient(app) as tc:
+                yield tc
+
+    def _answer(self):
+        from api.models import AskResponse
+
+        return AskResponse(
+            answer="ok", question="q", mode="naive", retriever_strategy="dense",
+            cost_usd=0.0, latency_ms=1.0, tokens_used=0,
+        )
+
+    def test_ask_succeeds_with_the_limiter_active(self, client):
+        with patch("api.app._ask_sync", return_value=self._answer()):
+            resp = client.post("/ask", json={"question": "hello?"})
+        assert resp.status_code == 200, resp.text
+
+    def test_quota_headers_reach_the_client(self, client):
+        """The reason headers_enabled is on: clients can back off."""
+        with patch("api.app._ask_sync", return_value=self._answer()):
+            resp = client.post("/ask", json={"question": "hello?"})
+        assert any(h.lower().startswith("x-ratelimit") for h in resp.headers)
+
+    def test_ingest_succeeds_with_the_limiter_active(self, client):
+        from api.models import IngestResponse
+
+        with patch(
+            "api.app._ingest_sync",
+            return_value=IngestResponse(
+                documents_loaded=1, chunks_created=1, chunks_added=1, collection_total=1
+            ),
+        ):
+            resp = client.post("/ingest", json={"path": "./data/sample_docs"})
+        assert resp.status_code != 500, resp.text
+
+    def test_upload_succeeds_with_the_limiter_active(self, client):
+        from api.models import UploadResponse
+
+        with patch(
+            "api.app._upload_sync",
+            return_value=UploadResponse(
+                filename="a.txt", department="general", documents_loaded=1,
+                chunks_created=1, chunks_added=1, collection_total=1,
+            ),
+        ):
+            resp = client.post(
+                "/upload",
+                files={"file": ("a.txt", b"hello", "text/plain")},
+                data={"department": "general"},
+            )
+        assert resp.status_code == 200, resp.text
+
+    def test_every_limited_endpoint_declares_a_response_parameter(self):
+        """The structural version of the same check.
+
+        slowapi injects quota headers through this parameter, so an
+        endpoint without one fails at request time, not import time.
+        """
+        import inspect
+        import re
+
+        import api.app
+
+        source = inspect.getsource(api.app)
+        offenders = []
+        for match in re.finditer(
+            r"@limiter\.limit\([^)]*\)\s*\n\s*async def (\w+)\(([^)]*)\)",
+            source,
+        ):
+            name, params = match.group(1), match.group(2)
+            if "response" not in params:
+                offenders.append(name)
+        assert not offenders, (
+            f"rate-limited endpoints missing a `response` parameter: {offenders} "
+            "— these return 500 whenever the limiter is enabled"
+        )
 
 
 # ---------------------------------------------------------------------------

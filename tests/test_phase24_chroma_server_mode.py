@@ -196,7 +196,9 @@ class TestBm25Staleness:
         with patch("src.retrieval.hybrid.settings") as s:
             s.bm25_cache_ttl = 300
             s.rrf_k = 60
+            s.bm25_max_documents = 0  # no memory ceiling in these tests
             yield s
+            hybrid.shutdown_rebuilds()
 
     def _entry(self, built_at=None, source_count=10):
         return hybrid._CachedIndex(
@@ -237,8 +239,14 @@ class TestBm25Staleness:
         ):
             assert hybrid._collection_count() == -1
 
-    def test_stale_entry_triggers_a_rebuild(self, bm25_settings):
-        """End-to-end: a stale cache must not be served."""
+    def test_stale_entry_is_served_while_it_rebuilds(self, bm25_settings):
+        """Stale-while-revalidate: the request must not pay for the rebuild.
+
+        Rebuilding inline meant every upload put a full corpus load,
+        re-tokenize and re-index onto whichever query happened to arrive
+        next. A few seconds of stale sparse ranking costs far less than a
+        latency spike on an arbitrary user's request.
+        """
         retriever = hybrid.HybridRetriever(k=2)
         store = MagicMock()
         store._collection.get.return_value = {
@@ -251,10 +259,81 @@ class TestBm25Staleness:
         hybrid._bm25_cache["__no_filter__"] = self._entry(source_count=99)
         with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
             retriever._build_bm25_index()
+            # Served immediately from the stale entry.
+            assert [d.page_content for d in retriever._corpus_docs] == ["cached"]
+            # ...and refreshed behind the request.
+            hybrid.shutdown_rebuilds(wait=True)
+
+        entry = hybrid._bm25_cache["__no_filter__"]
+        assert [d.page_content for d in entry.docs] == ["alpha document", "beta document"]
+        assert entry.source_count == 2
+
+    def test_a_burst_of_queries_triggers_one_rebuild(self, bm25_settings):
+        """Otherwise a busy endpoint stacks a rebuild per request."""
+        store = MagicMock()
+        store._collection.get.return_value = {
+            "ids": ["1"], "documents": ["alpha document"], "metadatas": [{}],
+        }
+        store._collection.count.return_value = 1
+        hybrid._bm25_cache["__no_filter__"] = self._entry(source_count=99)
+
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            for _ in range(5):
+                hybrid.HybridRetriever(k=2)._build_bm25_index()
+            hybrid.shutdown_rebuilds(wait=True)
+
+        # One rebuild, so one corpus load — not five.
+        assert store._collection.get.call_count == 1
+
+    def test_a_failed_background_rebuild_leaves_the_cache_usable(self, bm25_settings, caplog):
+        """A refresh that dies must not take sparse retrieval with it."""
+        import logging
+
+        hybrid._bm25_cache["__no_filter__"] = self._entry(source_count=99)
+        retriever = hybrid.HybridRetriever(k=2)
+
+        with patch(
+            "src.vectorstore.chroma_store.get_vectorstore",
+            side_effect=RuntimeError("chroma unreachable"),
+        ):
+            with caplog.at_level(logging.WARNING):
+                retriever._build_bm25_index()
+                hybrid.shutdown_rebuilds(wait=True)
+
+        assert hybrid._bm25_cache["__no_filter__"] is not None
+        assert [d.page_content for d in retriever._corpus_docs] == ["cached"]
+
+    def test_a_rebuild_slot_is_released_after_it_finishes(self, bm25_settings):
+        """A stuck flag would freeze the index at its stale contents forever."""
+        store = MagicMock()
+        store._collection.get.return_value = {
+            "ids": ["1"], "documents": ["alpha document"], "metadatas": [{}],
+        }
+        store._collection.count.return_value = 1
+        hybrid._bm25_cache["__no_filter__"] = self._entry(source_count=99)
+
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            hybrid.HybridRetriever(k=2)._build_bm25_index()
+            hybrid.shutdown_rebuilds(wait=True)
+
+        assert "__no_filter__" not in hybrid._rebuilding
+
+    def test_a_cold_cache_still_builds_synchronously(self, bm25_settings):
+        """Nothing to serve, so this one has to block."""
+        retriever = hybrid.HybridRetriever(k=2)
+        store = MagicMock()
+        store._collection.get.return_value = {
+            "ids": ["1", "2"],
+            "documents": ["alpha document", "beta document"],
+            "metadatas": [{}, {}],
+        }
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            retriever._build_bm25_index()
 
         assert [d.page_content for d in retriever._corpus_docs] == [
             "alpha document", "beta document",
         ]
+
 
     def test_fresh_entry_is_reused_without_a_rebuild(self, bm25_settings):
         retriever = hybrid.HybridRetriever(k=2)
@@ -312,3 +391,56 @@ class TestBm25Staleness:
         hybrid._bm25_cache["__no_filter__"] = self._entry()
         hybrid.reset_bm25_cache()
         assert hybrid._bm25_cache == {}
+
+
+class TestBm25MemoryCeiling:
+    """The index holds the whole corpus per filter key, in this process."""
+
+    @pytest.fixture(autouse=True)
+    def _settings(self):
+        with patch("src.retrieval.hybrid.settings") as s:
+            s.bm25_cache_ttl = 300
+            s.rrf_k = 60
+            s.bm25_max_documents = 100
+            yield s
+            hybrid.shutdown_rebuilds()
+
+    def _store(self, count):
+        store = MagicMock()
+        store._collection.count.return_value = count
+        store._collection.get.return_value = {
+            "ids": ["1"], "documents": ["alpha document"], "metadatas": [{}],
+        }
+        return store
+
+    def test_a_corpus_over_the_limit_degrades_to_dense_only(self, caplog):
+        """An OOM kill takes the replica down and explains nothing."""
+        import logging
+
+        hybrid.reset_bm25_cache()
+        retriever = hybrid.HybridRetriever(k=2)
+        store = self._store(count=5000)
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            with caplog.at_level(logging.WARNING):
+                retriever._build_bm25_index()
+
+        assert retriever._bm25 is None
+        assert "BM25_MAX_DOCUMENTS" in caplog.text
+        store._collection.get.assert_not_called()  # never loaded the corpus
+
+    def test_a_corpus_under_the_limit_still_builds(self):
+        hybrid.reset_bm25_cache()
+        retriever = hybrid.HybridRetriever(k=2)
+        store = self._store(count=50)
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            retriever._build_bm25_index()
+        assert retriever._bm25 is not None
+
+    def test_a_zero_limit_disables_the_ceiling(self, _settings):
+        _settings.bm25_max_documents = 0
+        hybrid.reset_bm25_cache()
+        retriever = hybrid.HybridRetriever(k=2)
+        store = self._store(count=10_000_000)
+        with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
+            retriever._build_bm25_index()
+        assert retriever._bm25 is not None

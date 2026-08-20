@@ -12,8 +12,8 @@ import re
 from pydantic import BaseModel, Field
 
 from config import settings
-from src.prompts import register
 from src.llm_pool import get_llm
+from src.prompts import register
 from src.resilience.circuit_breaker import CircuitBreakerOpen, get_breaker
 
 logger = logging.getLogger(__name__)
@@ -103,7 +103,6 @@ def extract_entities(query: str) -> list[Entity]:
 
     # Try LLM extraction first
     try:
-        from langchain_core.prompts import ChatPromptTemplate
 
         prompt = register(
             "entity_extract",

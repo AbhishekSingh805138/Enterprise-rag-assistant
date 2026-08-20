@@ -16,14 +16,15 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field
 
 from config import settings
-from src.prompts import register
 from src.graph.tracing import traced
 from src.llm_pool import get_llm
+from src.observability.cost_guard import allow as cost_allows
+from src.observability.cost_guard import remaining_sub_questions
+from src.prompts import register
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,14 @@ def planner(state: dict) -> dict:
         if not subs:
             subs = [question]
 
+        # Then clamp again to what the remaining per-query budget can pay
+        # for. Decomposition is where cost multiplies — each sub-question
+        # runs a full retrieve/grade/generate cycle — so this is the one
+        # point where a ceiling is worth more than anywhere downstream.
+        affordable = remaining_sub_questions(len(subs))
+        if affordable < len(subs):
+            subs = subs[:affordable]
+
         logger.info(
             "Planner: is_multi_part=%s, sub_questions=%d",
             result.is_multi_part, len(subs),
@@ -251,6 +260,18 @@ def process_sub_query(state: dict) -> dict:
 
     sub_q = sub_questions[idx]
     all_sub_docs = list(state.get("all_sub_documents", []))
+
+    # The planner's estimate can be wrong — an early sub-question may cost
+    # far more than expected. Re-check before each one so the ceiling holds
+    # even when the plan underestimated. Skipping to the end synthesises
+    # from the sub-answers already gathered rather than failing.
+    if idx > 0 and not cost_allows(f"sub-question {idx + 1}/{len(sub_questions)}"):
+        return {
+            "sub_answers": sub_answers,
+            "current_sub_idx": len(sub_questions),
+            "budget_truncated": True,
+        }
+
     logger.info("Processing sub-question [%d/%d]: %s", idx + 1, len(sub_questions), sub_q[:100])
 
     sub_answer, docs = _process_single_sub_query(sub_q, strategy)

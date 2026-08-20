@@ -31,7 +31,7 @@ Before choosing a platform, understand what this application requires:
 
 | Requirement | Reason | Impact |
 |-------------|--------|--------|
-| **Persistent disk storage** | ChromaDB (vectors), SQLite x3 (memory, metrics, cache), NetworkX JSON (knowledge graph) are all file-based | Eliminates serverless platforms without persistent storage |
+| **Persistent disk storage** | ChromaDB (vectors) and, on a single node, the SQLite stores and NetworkX JSON knowledge graph are file-based | Eliminates serverless platforms without persistent storage |
 | **Long-running requests** | LLM calls take 5-30s; RAGAS evaluation takes minutes | Eliminates platforms with <30s request timeouts |
 | **2+ GB RAM** | `sentence-transformers` loads PyTorch + cross-encoder model (~200MB model weights) | Eliminates free tiers with <512MB RAM |
 | **Two services** | FastAPI API (port 8000) + Streamlit UI (port 8501) | Platform must support multi-service or multiple apps |
@@ -62,6 +62,25 @@ Before choosing a platform, understand what this application requires:
 > **Recommendation**: Use **Railway** for the fastest path to production. Use a **VPS** if you want full control and lower long-term costs.
 
 > **Avoid**: Vercel (serverless, no persistent storage, no long-running processes), GCP Cloud Run (no persistent disk), Heroku (ephemeral filesystem, SQLite data lost on restart).
+
+### Before running more than one replica
+
+Everything above assumes a single node. Four pieces of state are
+per-process by default, and each fails *silently* rather than loudly when
+a second replica appears — which is why they are listed here rather than
+left to be discovered:
+
+| Set this | Otherwise |
+|----------|-----------|
+| `DATABASE_URL=postgresql://…` | Each replica keeps its own document registry (the same document indexes twice) and its own conversation memory (a follow-up question routed elsewhere forgets the thread). Metrics report only the traffic that replica served. |
+| `RATE_LIMIT_STORAGE_URI=redis://…` | Counters are per-process, so N replicas allow N x the configured limit, and a restart resets them. |
+| `CHROMA_MODE=server` | Embedded ChromaDB cannot see another process's writes; the API never serves a document the worker indexed. |
+| `EVENT_BUS=kafka` | The SQLite queue is durable but local — workers must share one `EVENT_BUS_PATH`, which means one host. |
+
+`docker-compose.prod.yml` sets all four. The API logs a warning at
+startup when it detects the single-node configuration together with auth
+or async ingestion enabled, so a deployment that believes it is scaled
+can see that it is not.
 
 ---
 
@@ -695,6 +714,45 @@ curl "https://api.your-domain.com/health?deep=true"
 docker compose -f docker-compose.prod.yml exec api python -m scripts.metrics --last 50
 ```
 
+### Prometheus & alerting
+
+`GET /metrics` exposes cost, latency percentiles, IDK rate, queue depth,
+dead-letter depth and per-status document counts in Prometheus exposition
+format. It requires an API key for the same reason `?deep=true` does —
+the body carries queue depths and per-department document counts.
+
+```bash
+curl -H "Authorization: Bearer $RAG_API_KEY" https://api.your-domain.com/metrics
+```
+
+A scrape config and alert rules ship in `deploy/prometheus/`:
+
+```bash
+docker run -p 9090:9090 \
+  -v "$PWD/deploy/prometheus:/etc/prometheus" \
+  prom/prometheus:v2.55.1
+```
+
+The rules cover the conditions that otherwise need a person to go
+looking. Two are worth calling out because they are specific to a RAG
+system rather than to web services generally:
+
+- **`RagDeadLetterQueueNonEmpty`** — a dead-lettered document is not
+  slow, it is never going to be indexed. Nobody notices until someone
+  asks a question it should have answered.
+- **`RagIdkRateSpike`** — a rising "I don't know" rate almost never means
+  the questions got harder. It means retrieval broke: an empty
+  collection, a changed embedding model, a scoping change that filtered
+  everything out. All of those look healthy to every other probe.
+
+### Distributed tracing (optional)
+
+`OTEL_ENABLED=true` with `OTEL_EXPORTER_OTLP_ENDPOINT` emits spans, and
+propagates the trace context *inside the ingestion event* — so an upload
+and the indexing that happens minutes later in the worker process appear
+as one trace rather than two unrelated ones. With it off, the SDK is
+never imported.
+
 ### Log Management
 
 ```bash
@@ -764,20 +822,33 @@ Also set up OpenAI usage alerts:
 
 | Component | Bottleneck | Max Capacity |
 |-----------|-----------|-------------|
-| SQLite | Single writer at a time | ~50 concurrent users |
+| SQLite (`DATABASE_URL` unset) | Single writer at a time | ~50 concurrent users |
 | ChromaDB (embedded) | Single process | ~100K documents |
-| Uvicorn (2 workers) | CPU-bound LLM calls | ~10 concurrent queries |
+| Uvicorn (1 worker) | Latency-bound LLM calls | ~10 concurrent queries |
 | Cross-encoder | CPU inference | ~5 reranking requests/sec |
+| BM25 sparse index | Whole corpus in memory, per filter key | `BM25_MAX_DOCUMENTS` (200K default), then dense-only |
+
+Measure rather than guess — `loadtest/locustfile.py` reports p50, p95,
+failure rate and IDK rate, and exits non-zero on the same thresholds the
+Prometheus alerts use:
+
+```bash
+pip install locust
+locust -f loadtest/locustfile.py --host http://localhost:8000 \
+       --headless -u 20 -r 2 -t 5m --csv loadtest/results
+```
 
 ### When to Scale
 
 | Signal | Action |
 |--------|--------|
-| Response times > 10s consistently | Increase RAM, add more uvicorn workers |
-| SQLite lock errors in logs | Migrate to PostgreSQL |
+| `rag_query_latency_ms{quantile="0.95"}` > 15s | Increase RAM, add API replicas (see the multi-replica settings above) |
+| SQLite lock errors in logs | Set `DATABASE_URL` to PostgreSQL |
 | ChromaDB query latency > 500ms | Switch to managed Pinecone/Weaviate |
-| > 50 concurrent users | Add a load balancer, horizontal scaling |
-| OpenAI rate limits | Add request queuing, use multiple API keys |
+| `rag_ingestion_queue_depth` rising and not draining | `--scale worker=N`, or raise `WORKER_CONCURRENCY` |
+| Uploads returning 503 | Backpressure is shedding load; the pipeline needs more workers |
+| Corpus past `BM25_MAX_DOCUMENTS` | Move sparse retrieval server-side (OpenSearch/Elasticsearch) |
+| OpenAI rate limits | Set `LLM_FALLBACK_PROVIDER` for failover; add request queuing |
 
 ### Vertical Scaling (Easy)
 

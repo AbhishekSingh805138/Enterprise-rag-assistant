@@ -1,0 +1,135 @@
+# Alert rules for the Enterprise RAG Assistant.
+#
+# The system already measured cost, latency, IDK rate and queue depth —
+# but nothing paged anyone, so every one of these conditions could only
+# be found by a person deciding to look. These are the four the
+# production-readiness review named, plus the ones that turned out to
+# share the same failure signature.
+#
+# Load alongside the scrape config:
+#   rule_files: ["alerts.yml"]
+groups:
+  - name: rag-ingestion
+    rules:
+      # The review's first alert. A dead-lettered document is not slow —
+      # it is never going to be indexed. Nobody will notice it is missing
+      # until they ask a question it should have answered.
+      - alert: RagDeadLetterQueueNonEmpty
+        expr: rag_ingestion_dlq_depth > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} document(s) dead-lettered"
+          description: >-
+            These documents will never be indexed without an operator.
+            Inspect with `python -m scripts.replay_dlq --list`, then
+            redrive with `python -m scripts.replay_dlq --all`.
+
+      # Depth alone is a poor signal: a burst upload is legitimately deep
+      # and drains fine. What matters is that it is not draining.
+      - alert: RagIngestionBacklogNotDraining
+        expr: deriv(rag_ingestion_queue_depth[30m]) >= 0 and rag_ingestion_queue_depth > 100
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "Ingestion backlog is {{ $value }} and not shrinking"
+          description: >-
+            Workers are stalled or under-provisioned. Check worker logs and
+            scale with `--scale worker=N`, or raise WORKER_CONCURRENCY.
+
+      # Backpressure is working as designed, but callers are being
+      # refused — that is a capacity decision someone has to make.
+      - alert: RagUploadsBeingRefused
+        expr: rag_ingestion_queue_depth >= rag_ingestion_queue_limit
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Uploads are being refused (queue at its limit)"
+
+  - name: rag-quality
+    rules:
+      # The most RAG-specific alert here. A rising IDK rate almost never
+      # means the questions got harder; it means retrieval broke — an
+      # empty collection, a bad embedding migration, a scoping change
+      # that filtered everything out. All of those look healthy to every
+      # other probe.
+      - alert: RagIdkRateSpike
+        expr: rag_idk_rate > 0.4
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of answers are 'I don't know'"
+          description: >-
+            Check the collection document count and whether the embedding
+            model changed. `GET /health?deep=true` reports both.
+
+      - alert: RagGraderRejectionHigh
+        expr: rag_grader_rejection_rate > 0.5
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Relevance grader is rejecting most retrieved context"
+          description: >-
+            Retrieval quality has degraded. Compare rag_build_info's
+            prompt_set label against the last known-good deploy.
+
+  - name: rag-latency-and-cost
+    rules:
+      - alert: RagP95LatencyHigh
+        expr: rag_query_latency_ms{quantile="0.95"} > 15000
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "p95 query latency is {{ $value }}ms"
+
+      # Fires before the cap denies traffic, so someone can decide
+      # whether to raise it rather than discovering it via a 503.
+      - alert: RagDailySpendApproachingCap
+        expr: rag_cost_usd_today > 0.8 * on() group_left() (rag_cost_daily_cap_usd > 0)
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Daily LLM spend at {{ $value }} USD, over 80% of the cap"
+
+      # Works with no cap configured: a sudden jump in per-query cost is
+      # worth knowing about regardless.
+      - alert: RagQueryCostRegression
+        expr: rag_query_cost_usd_avg > 3 * avg_over_time(rag_query_cost_usd_avg[7d])
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Mean query cost tripled against its 7-day baseline"
+          description: >-
+            Usually a prompt or model change. rag_build_info carries the
+            prompt_set and llm_model that produced it.
+
+  - name: rag-availability
+    rules:
+      - alert: RagApiDown
+        expr: up{job="rag-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "RAG API is not responding to scrapes"
+
+      # Without this, a broken collector looks identical to a metric
+      # that is genuinely zero — which is the worst way to lose an alert.
+      - alert: RagMetricsCollectorFailing
+        expr: rag_metrics_collector_errors > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} metrics collector(s) failing"
+          description: >-
+            Some series are missing rather than zero, so alerts that
+            depend on them are silently not firing.

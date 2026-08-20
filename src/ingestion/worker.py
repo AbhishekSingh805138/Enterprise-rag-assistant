@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from config import settings
@@ -41,6 +42,7 @@ from src.ingestion.registry import (
     DocumentRegistry,
     get_registry,
 )
+from src.observability import tracing_otel as otel
 from src.observability.request_context import reset_request_id, set_request_id
 from src.storage.object_store import ObjectNotFoundError, ObjectStore, get_object_store
 
@@ -114,11 +116,26 @@ class IngestionWorker:
     # -- single event ------------------------------------------------------
 
     def handle(self, delivery: Delivery) -> str:
-        """Process one delivery to completion. Always settles the delivery."""
+        """Process one delivery to completion. Always settles the delivery.
+
+        The span is parented to the upload that published the event, so a
+        document that took minutes to become queryable reads as one trace
+        across both processes instead of two unrelated ones.
+        """
         event = delivery.event
         token = set_request_id(event.request_id or None)
         try:
-            return self._handle_inner(delivery, event)
+            with otel.consumer_span(
+                "ingestion.index",
+                event.payload,
+                **{
+                    "document.id": event.document_id,
+                    "document.department": event.payload.get("department"),
+                    "event.attempt": event.attempt,
+                    "event.id": event.event_id,
+                },
+            ):
+                return self._handle_inner(delivery, event)
         finally:
             reset_request_id(token)
 
@@ -240,8 +257,30 @@ class IngestionWorker:
 
     # -- loop --------------------------------------------------------------
 
+    def _handle_settled(self, delivery: Delivery) -> str | None:
+        """Handle one delivery, guaranteeing it is settled either way."""
+        try:
+            return self.handle(delivery)
+        except Exception:
+            # handle() is meant to settle every delivery itself; if it
+            # raised before doing so, release the event rather than
+            # holding it invisible until the timeout lapses.
+            logger.exception("Unhandled error while processing a delivery")
+            try:
+                delivery.nack(delay_s=settings.ingest_retry_backoff_s)
+            except Exception:
+                logger.debug("Could not nack after unhandled error", exc_info=True)
+            return None
+
     def poll_once(self, timeout_s: float | None = None) -> list[str]:
-        """Claim and handle one batch. Returns the outcome of each event."""
+        """Claim and handle one batch. Returns the outcome of each event.
+
+        A batch is processed concurrently when ``WORKER_CONCURRENCY`` is
+        above 1. Indexing is dominated by waiting on the embedding API,
+        not by CPU, so threads raise per-pod throughput several times over
+        without another process — and each document's registry claim is
+        already the thing that makes parallel consumers safe.
+        """
         deliveries = self._bus.poll(
             self._topic,
             self._group,
@@ -249,20 +288,18 @@ class IngestionWorker:
             timeout_s=timeout_s if timeout_s is not None else settings.worker_poll_interval_s,
         )
         self.stats.polled += len(deliveries)
-        outcomes = []
-        for delivery in deliveries:
-            try:
-                outcomes.append(self.handle(delivery))
-            except Exception:
-                # handle() is meant to settle every delivery itself; if it
-                # raised before doing so, release the event rather than
-                # holding it invisible until the timeout lapses.
-                logger.exception("Unhandled error while processing a delivery")
-                try:
-                    delivery.nack(delay_s=settings.ingest_retry_backoff_s)
-                except Exception:
-                    logger.debug("Could not nack after unhandled error", exc_info=True)
-        return outcomes
+
+        concurrency = max(1, settings.worker_concurrency)
+        if concurrency == 1 or len(deliveries) < 2:
+            results = [self._handle_settled(d) for d in deliveries]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(concurrency, len(deliveries)),
+                thread_name_prefix="ingest",
+            ) as pool:
+                results = list(pool.map(self._handle_settled, deliveries))
+
+        return [outcome for outcome in results if outcome is not None]
 
     def run(self, stop_event: threading.Event | None = None) -> WorkerStats:
         """Consume until *stop_event* is set. Blocks the calling thread."""

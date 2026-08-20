@@ -1,7 +1,15 @@
 # Enterprise RAG Assistant - Project Context
 
-**Last updated:** 2026-06-02 (Session 9)
-**Updated by:** Lead Software Engineer — Phase 7 ship (API + UI + Docker)
+**Last updated:** 2026-08-20
+**Updated by:** Phase 27 (operability + spend control) — code complete, uncommitted
+
+> **Scope note.** This file tracked sessions 1–9 in detail (phases 1–7) and
+> then went unmaintained through phases 8–27. Rather than reconstruct a
+> session narrative that no longer exists, the phase table and gap lists
+> below have been corrected against the working tree, and the detailed
+> record of phases 8–27 now lives in **`ARCHITECTURE.md` §2.3–§2.9** and in
+> git history. The session log at the bottom is left as the historical
+> record for phases 1–7 only.
 
 ---
 
@@ -92,6 +100,27 @@ API + UI (Phase 7):
 | 5 — Multi-agent + tools | **COMPLETE** | Planner/synthesizer, Tavily web search, calculator + data lookup tools, 183 tests |
 | 6 — Observability | **COMPLETE** | CostCallbackHandler, SQLite MetricsStore, CLI dashboard, LangSmith auto-tracing, 212 tests |
 | 7 — Ship (API/UI/Docker) | **COMPLETE** | FastAPI (4 endpoints + SSE streaming), Streamlit chat UI, Docker + compose, 228 tests |
+
+The original 7-phase plan ended here. Everything below was added after,
+and is documented in `ARCHITECTURE.md` rather than re-narrated here.
+
+| Phase | Status | Details |
+|-------|--------|---------|
+| 8 — Breadth hardening | **COMPLETE** | Retrieval, ingestion, prompts, resilience, multipart, graph intelligence, infra |
+| 9 — Security & concurrency | **COMPLETE** | Circuit breaker, thread safety, CORS/upload/path-traversal hardening |
+| 10–14 — Conversation & context | **COMPLETE** | Memory store, intent detection, query transformer, cross-encoder rerank, context builder |
+| 15–16 — Cache & KG | **COMPLETE** | Semantic cache activation, knowledge-graph extraction |
+| 17–20 — Guardrails to parallelism | **COMPLETE** | Security guardrails, MCP tool router, monitoring, parallel execution |
+| 21 — Unified analysis | **COMPLETE** | One structured LLM call replaces intent→transform→plan (`UNIFIED_ANALYSIS`, default off) — ARCHITECTURE §2.4 |
+| 22 — Async ingestion | **COMPLETE** | Object store, Kafka/SQLite event bus, worker, retry/DLQ, document registry — §2.5 |
+| 23 — Coverage | **COMPLETE** | Eval harness, health checks, Kafka bus, retrievers, vectorstore, config edges |
+| 24 — Chroma server mode | **COMPLETE** | Migration + cross-process index visibility — §2.6 |
+| 25 — Capability & replay | **COMPLETE** | Capability-aware validation, DLQ recovery — §2.7 |
+| 26 — Prod hardening | **COMPLETE** | Integration tests against real backends — §2.8 |
+| 27 — Operability & spend | **CODE COMPLETE, UNCOMMITTED** | Cost guard, Prometheus `/metrics`, OTEL through the queue, prompt versioning, RAGAS gate, backpressure, ingest PII, parse safety, LSH cache, Postgres-backed shared state, department RBAC — §2.9 |
+
+**Test suite: 1675 passed, 1 skipped, 24 deselected.** The deselected ones
+are `-m integration` and need `docker-compose.test.yml` running.
 
 ---
 
@@ -191,12 +220,15 @@ API + UI (Phase 7):
 
 ## Pending Tasks
 
-All 7 phases are complete. Potential future enhancements:
-- [ ] Authentication (API key or JWT) for /ask and /eval endpoints
-- [ ] Prometheus metrics export
-- [ ] Production Postgres checkpointer (replace SQLite for multi-process)
-- [ ] BM25 index caching (currently rebuilt per query)
-- [ ] Next.js UI for more polished frontend
+The Phase 7 wishlist is done: API-key auth, Prometheus export, Postgres-
+backed stores and BM25 index caching all landed in later phases. What is
+actually outstanding:
+
+- [ ] **Commit the Phase 27 changeset** — code complete and green, still in the working tree
+- [ ] Async query path — nodes are still sync, so concurrency is bounded by the thread pool
+- [ ] Store-native hybrid search (OpenSearch/Elasticsearch) — BM25 still loads the corpus per replica, capped by `BM25_MAX_DOCUMENTS`
+- [ ] A/B testing of retrieval strategies under live traffic
+- [ ] Next.js UI for a more polished frontend
 
 ---
 
@@ -226,14 +258,20 @@ All 7 phases are complete. Potential future enhancements:
 ## Known Issues
 
 1. `langchain-community` deprecation warning (no standalone replacement for TextLoader/PyPDFLoader yet)
-2. BM25 index is rebuilt per query (acceptable for 41 chunks; needs caching at scale)
-3. Critic adds ~2s latency per query (one LLM call for claim extraction + one for rewrite if needed)
-4. Planner adds ~1-2s per query (one LLM call for classification/decomposition); multi-part questions add N additional retrieval+generation cycles
-5. Embedding costs (OpenAIEmbeddings) are not captured by CostCallbackHandler — embeddings don't fire on_llm_end. Cost is negligible (~$0.0001/query).
+2. Critic adds ~2s latency per query (one LLM call for claim extraction + one for rewrite if needed). `CRITIC_MODE=adaptive` skips it for low-risk answers.
+3. Planner adds ~1-2s per query; multi-part questions add N retrieval+generation cycles. `UNIFIED_ANALYSIS=true` merges the analysis calls.
+4. Embedding costs are not captured by CostCallbackHandler — embeddings don't fire `on_llm_end`. Negligible per query (~$0.0001), but it means ingestion spend never counts toward `COST_DAILY_CAP_USD`.
+5. The local `.venv` drifts from `requirements.txt`. A red suite here is usually missing declared dependencies, not a regression — enumerate them before debugging. CI installs `requirements.lock` with `--require-hashes`, so CI never shows this.
 
 ## Next Steps
 
-All 7 phases are complete. The project is demo-ready. See "Pending Tasks" for future enhancements.
+Phase 27 is code complete, reviewed, and the suite is green (1675 passing).
+The one defect the review found — `/eval` ignoring the daily cost cap, and
+RAGAS judge spend never being recorded — is fixed and covered by
+`tests/test_phase27_eval_cost_cap.py`. The changeset is still uncommitted.
+
+1. Commit Phase 27 on a branch.
+2. Then: async query path, store-native hybrid search.
 
 ---
 
@@ -309,6 +347,9 @@ All 7 phases are complete. The project is demo-ready. See "Pending Tasks" for fu
 ---
 
 ## Session History
+
+Sessions 1–9 only, covering phases 1–7. Phases 8–27 were not logged here;
+see `ARCHITECTURE.md` §2.3–§2.9 and git history.
 
 ### Session 1 — 2026-06-01
 - **Actions:** Full codebase review, PRD/TRD analysis, gap identification

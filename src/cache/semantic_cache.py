@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
 from config import settings
+from src.cache.lsh import BANDS, signature
+from src.storage.sql import SqlDatabase
+
+# Upper bound on candidates compared per lookup. LSH normally returns a
+# handful; this bounds the pathological case where many entries share a
+# bucket, so one unlucky query cannot turn into the scan this replaced.
+_MAX_CANDIDATES = 200
 
 logger = logging.getLogger(__name__)
 
@@ -50,21 +56,34 @@ class SemanticCache:
     """Embedding-based semantic cache for query-answer pairs."""
 
     def __init__(self, db_path: str, embed_fn=None) -> None:
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._db = SqlDatabase(db_path)
+        self._conn = self._db
+        self._lock = self._db.lock
         self._conn.execute(_CREATE_CACHE_TABLE)
         self._conn.commit()
-        # Migration: scope column isolates cache entries by retrieval filter /
-        # access scope so answers never leak across those boundaries.
-        try:
-            self._conn.execute(
-                "ALTER TABLE semantic_cache ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+
+        # Migration: scope isolates entries by retrieval filter / access
+        # scope so answers never cross those boundaries; band* are the
+        # LSH buckets that keep lookup from scanning the whole table.
+        #
+        # Rows written before the band columns existed keep NULL and stop
+        # matching. That is a cache miss, not a wrong answer — the entry
+        # is recomputed and rewritten with bands, and the stale rows age
+        # out on their TTL.
+        migrations = [
+            "ALTER TABLE semantic_cache ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
+            *[
+                f"ALTER TABLE semantic_cache ADD COLUMN band{i} INTEGER"
+                for i in range(BANDS)
+            ],
+            *[
+                f"CREATE INDEX IF NOT EXISTS idx_cache_band{i} "
+                f"ON semantic_cache (scope, band{i})"
+                for i in range(BANDS)
+            ],
+        ]
+        self._db.executescript(migrations)
         self._embed_fn = embed_fn
-        self._lock = threading.Lock()
 
     def _get_embed_fn(self):
         """Lazy-load embedding function."""
@@ -107,15 +126,32 @@ class SemanticCache:
             logger.debug("Cache lookup failed: embedding error", exc_info=True)
             return None
 
-        # Fetch all cached entries (for small cache sizes this is fine;
-        # for large-scale use, switch to a vector index)
+        # Retrieve only entries that hash into one of the query's bands.
+        # The previous version loaded every row for the scope — each with
+        # its full 1536-float embedding — and compared them in Python,
+        # which made a cache hit slower than a cache miss once the table
+        # grew. LSH prunes; exact cosine below still decides, so a false
+        # positive costs one comparison and can never return a wrong
+        # answer.
+        bands = signature(query_embedding)
         now = datetime.now(UTC)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, query, answer, embedding, mode, strategy, created_at, ttl "
-                "FROM semantic_cache WHERE scope = ?",
-                (scope,),
-            ).fetchall()
+            if bands:
+                # Positional comparison, not a set membership test: band
+                # values are namespaced by their index, so band 2 of the
+                # query can only ever equal band 2 of a stored row. That
+                # makes this exactly the union of the band buckets.
+                clause = " OR ".join(f"band{i} = ?" for i in range(len(bands)))
+                rows = self._conn.execute(
+                    "SELECT id, query, answer, embedding, mode, strategy, created_at, ttl "
+                    f"FROM semantic_cache WHERE scope = ? AND ({clause}) LIMIT ?",
+                    (scope, *bands, _MAX_CANDIDATES),
+                ).fetchall()
+            else:
+                # Unusable embedding (empty or all zeros): nothing to
+                # match against, and bucketing them together would make
+                # every degenerate query collide.
+                rows = []
 
         best_score = 0.0
         best_answer = None
@@ -174,10 +210,20 @@ class SemanticCache:
             logger.debug("Cache store failed: embedding error", exc_info=True)
             return
 
+        # Bucket on write so lookup can find it without a scan. A vector
+        # that produces no signature is still stored — it just will not
+        # be retrieved, which is the honest outcome for an embedding that
+        # cannot be compared to anything.
+        bands = signature(embedding)
+        band_values = list(bands) + [None] * (BANDS - len(bands))
+        band_columns = ", ".join(f"band{i}" for i in range(BANDS))
+        band_placeholders = ", ".join("?" for _ in range(BANDS))
+
         with self._lock:
             self._conn.execute(
-                "INSERT INTO semantic_cache (query, answer, embedding, mode, strategy, created_at, ttl, scope) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO semantic_cache "
+                f"(query, answer, embedding, mode, strategy, created_at, ttl, scope, {band_columns}) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, {band_placeholders})",
                 (
                     query,
                     answer,
@@ -187,6 +233,7 @@ class SemanticCache:
                     datetime.now(UTC).isoformat(),
                     cache_ttl,
                     scope,
+                    *band_values,
                 ),
             )
             self._conn.commit()

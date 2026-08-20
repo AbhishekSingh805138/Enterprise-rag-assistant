@@ -16,6 +16,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -69,6 +70,31 @@ class _CachedIndex:
 _bm25_cache: dict[str, _CachedIndex] = {}
 _bm25_lock = threading.Lock()
 
+# Cache keys with a rebuild already running, so a burst of concurrent
+# queries triggers one rebuild rather than one per request.
+_rebuilding: set[str] = set()
+# Single background worker: rebuilds are memory-heavy, and running several
+# at once is how a refresh turns into an out-of-memory kill.
+_rebuild_pool: ThreadPoolExecutor | None = None
+
+
+def _submit_rebuild(fn) -> None:
+    """Run *fn* off the request path, at most one rebuild at a time."""
+    global _rebuild_pool
+    if _rebuild_pool is None:
+        _rebuild_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bm25-rebuild"
+        )
+    _rebuild_pool.submit(fn)
+
+
+def shutdown_rebuilds(wait: bool = True) -> None:
+    """Stop the background rebuild worker (tests, and clean shutdown)."""
+    global _rebuild_pool
+    pool, _rebuild_pool = _rebuild_pool, None
+    if pool is not None:
+        pool.shutdown(wait=wait)
+
 
 def _tokenize(text: str) -> list[str]:
     """Regex-based tokenizer with stop-word filtering for BM25."""
@@ -80,6 +106,7 @@ def reset_bm25_cache() -> None:
     """Clear the BM25 cache (call after adding new documents)."""
     with _bm25_lock:
         _bm25_cache.clear()
+        _rebuilding.clear()
     logger.debug("BM25 cache cleared")
 
 
@@ -141,6 +168,27 @@ class HybridRetriever(BaseRetriever):
 
         return json.dumps(filter, sort_keys=True, default=str)
 
+    def _schedule_rebuild(self, cache_key: str) -> None:
+        """Refresh *cache_key* in the background, at most once at a time."""
+        with _bm25_lock:
+            if cache_key in _rebuilding:
+                return
+            _rebuilding.add(cache_key)
+
+        def _run() -> None:
+            try:
+                # A detached retriever so the rebuild cannot mutate the
+                # instance currently serving a request.
+                worker = HybridRetriever(k=self.k, fetch_k=self.fetch_k, filter=self.filter)
+                worker._build_index_now(cache_key)
+            except Exception:
+                logger.exception("Background BM25 rebuild failed for key=%s", cache_key)
+            finally:
+                with _bm25_lock:
+                    _rebuilding.discard(cache_key)
+
+        _submit_rebuild(_run)
+
     def _build_bm25_index(self) -> None:
         """Load all documents from ChromaDB and build a BM25 index.
 
@@ -152,15 +200,55 @@ class HybridRetriever(BaseRetriever):
         # Check module-level cache first (thread-safe)
         with _bm25_lock:
             cached = _bm25_cache.get(cache_key)
-        if cached is not None and not _is_stale(cached):
+
+        if cached is not None:
+            if not _is_stale(cached):
+                self._bm25, self._corpus_docs = cached.bm25, cached.docs
+                logger.debug(
+                    "BM25 cache hit for key=%s (%d docs)", cache_key, len(self._corpus_docs)
+                )
+                return
+
+            # Stale, but usable. Serve it and refresh behind the request.
+            #
+            # Rebuilding here would mean every upload put a full corpus
+            # load, re-tokenize and re-index on whichever unlucky query
+            # arrived next — negligible at a hundred chunks, seconds of
+            # CPU at a hundred thousand. A few seconds of staleness in
+            # sparse ranking is a far smaller cost than a latency spike
+            # on an arbitrary user's request.
             self._bm25, self._corpus_docs = cached.bm25, cached.docs
-            logger.debug("BM25 cache hit for key=%s (%d docs)", cache_key, len(self._corpus_docs))
+            self._schedule_rebuild(cache_key)
             return
 
+        # Cold start: nothing cached, so there is nothing to serve while
+        # a background build runs. This one has to be synchronous.
+        self._build_index_now(cache_key)
+
+    def _build_index_now(self, cache_key: str) -> None:
+        """Load the corpus and build the index, blocking the caller."""
         from src.vectorstore.chroma_store import get_vectorstore
 
         store = get_vectorstore()
         collection = store._collection
+
+        # The whole corpus is loaded into this process, per filter key, so
+        # the ceiling is memory rather than time. Past the limit, degrade
+        # to dense-only and say so — an OOM kill takes the replica with it
+        # and gives no clue why.
+        limit = settings.bm25_max_documents
+        if limit > 0:
+            count = _collection_count()
+            if count > limit:
+                logger.warning(
+                    "Corpus of %d documents exceeds BM25_MAX_DOCUMENTS=%d — "
+                    "serving dense-only. Move sparse retrieval server-side "
+                    "(OpenSearch/Elasticsearch) to keep hybrid ranking at this scale.",
+                    count, limit,
+                )
+                self._corpus_docs = []
+                self._bm25 = None
+                return
 
         try:
             result = collection.get(include=["documents", "metadatas"])

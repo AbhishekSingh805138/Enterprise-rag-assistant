@@ -131,6 +131,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Validate deployment compose files
+        env:
+          # docker-compose.prod.yml requires POSTGRES_PASSWORD with `:?`
+          # rather than defaulting it — a deployment that forgets the
+          # password should fail to start, not come up with a well-known
+          # one. Validation still needs *a* value to interpolate.
+          POSTGRES_PASSWORD: ci-validation-only
         run: |
           docker compose -f docker-compose.prod.yml config --quiet
           docker compose -f docker-compose.test.yml config --quiet

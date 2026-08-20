@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,38 @@ def collect_predictions(
     return rows
 
 
+def record_judge_spend(handler, num_items: int, latency_ms: float) -> None:
+    """Write the judge's token spend to the metrics store.
+
+    The four metrics are themselves LLM calls, and they do not go through
+    ``ask()``/``answer()`` — ragas invokes its own model. So this spend
+    reached no store, showed up on no dashboard, and never accumulated
+    toward ``COST_DAILY_CAP_USD``, even though it is the larger half of
+    what a run costs.
+
+    Recorded as ``mode="eval"`` so a run is distinguishable from user
+    traffic: it should count against the day's budget without being read
+    as a spike in query volume.
+    """
+    from src.observability.metrics_store import get_store
+
+    metrics = handler.flush(
+        thread_id=f"ragas-{uuid4().hex[:8]}",
+        question=f"RAGAS judge over {num_items} item(s)",
+        latency_ms=latency_ms,
+        retriever_strategy="n/a",
+        mode="eval",
+    )
+    if metrics.total_tokens == 0 and metrics.estimated_cost_usd == 0.0:
+        # Nothing observed — a stubbed or cached judge. No row worth writing.
+        return
+    get_store().record(metrics)
+    logger.info(
+        "RAGAS judge spend: $%.5f over %d tokens",
+        metrics.estimated_cost_usd, metrics.total_tokens,
+    )
+
+
 def run_ragas(rows: dict) -> dict:
     """Run RAGAS evaluation over collected predictions.
 
@@ -94,11 +127,26 @@ def run_ragas(rows: dict) -> dict:
         faithfulness,
     )
 
+    from src.observability.cost_callback import CostCallbackHandler
+
     dataset = Dataset.from_dict(rows)
+    handler = CostCallbackHandler()
+    start = time.perf_counter()
     result = ragas_evaluate(
         dataset,
         metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+        callbacks=[handler],
     )
+    try:
+        record_judge_spend(
+            handler,
+            num_items=len(rows.get("question", [])),
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
+    except Exception:
+        # A finished run is expensive and not reproducible for free.
+        # Losing its scores over cost bookkeeping would be the wrong trade.
+        logger.warning("Could not record RAGAS judge spend", exc_info=True)
     # ragas 0.2.x EvaluationResult stores mean scores in _repr_dict
     return dict(result._repr_dict)
 

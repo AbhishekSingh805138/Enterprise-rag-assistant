@@ -22,6 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.ingestion.registry import DocumentRecord
+from src.ingestion.safety import (
+    DocumentTooLarge,
+    ParseTimeout,
+    apply_pii_policy,
+    enforce_extracted_size,
+    parse_with_timeout,
+)
 from src.storage.object_store import ObjectStore, get_object_store
 
 logger = logging.getLogger(__name__)
@@ -87,14 +94,31 @@ def process_document(
         (dept_dir / record.filename).write_bytes(data)
 
         # --- Parse Document ---
+        # Bounded: these are bytes a stranger uploaded, and PDF/DOCX
+        # parsers are a well-known exploit surface. Both limits raise
+        # DocumentParseError so the worker dead-letters immediately —
+        # retrying a decompression bomb twice more spends the budget on
+        # the same outcome.
         try:
-            docs = load_path(tmpdir)
+            docs = parse_with_timeout(load_path, tmpdir)
         except FileNotFoundError as e:
             # The loader skips files it cannot read, then reports "nothing
             # found" — for a single-file ingest that means a parse failure.
             raise DocumentParseError(
                 f"Could not parse {record.filename!r}: {e}"
             ) from e
+        except ParseTimeout as e:
+            raise DocumentParseError(f"{record.filename!r}: {e}") from e
+
+        try:
+            enforce_extracted_size(docs)
+        except DocumentTooLarge as e:
+            raise DocumentParseError(f"{record.filename!r}: {e}") from e
+
+        # Screen for PII before anything is embedded. The answer-time
+        # filter cannot help here: once text is embedded, the vectors and
+        # every backup of them hold the original.
+        apply_pii_policy(docs, document_id=record.document_id)
 
         source = stable_source(record.department, record.filename)
         for doc in docs:

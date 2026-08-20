@@ -54,6 +54,13 @@ from api.models import (
 )
 from api.rate_limit import build_limiter, verify_storage
 from config import settings, setup_logging
+from src.ingestion.backpressure import (
+    QueueSaturated,
+    check_capacity,
+    retry_after_seconds,
+)
+from src.observability import tracing_otel as otel
+from src.observability.cost_guard import daily_cap_exceeded
 from src.observability.request_context import (
     get_request_id,
     new_request_id,
@@ -68,6 +75,7 @@ from src.security.access_control import (
 from src.security.auth import permitted_departments, verify_api_key
 from src.security.guardrails import check_guardrails
 from src.security.output_filter import filter_output
+from src.storage.sql import warn_if_single_node
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +95,15 @@ def _safe_error_detail(e: Exception) -> str:
     if settings.debug_mode:
         return str(e)
     return "An internal error occurred. Please try again or contact support."
+
+
+def _seconds_until_utc_midnight() -> int:
+    """Retry-After for the daily cost cap, which resets at UTC midnight."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
 
 
 def _scoped_session_id(request: Request, session_id: str | None) -> str | None:
@@ -200,6 +217,13 @@ async def lifespan(app: FastAPI):
         if scopes.any_scoped:
             logger.info("Department scoping active on %d API key(s)", len(scopes.scopes) - unscoped)
 
+    # Traces are optional; this is a no-op unless OTEL_ENABLED=true.
+    otel.setup_tracing("rag-api")
+
+    # Local SQLite files look identical to a working deployment right up
+    # until a second replica exists.
+    warn_if_single_node()
+
     # Probe the rate limiter's backend now. A shared store that is
     # unreachable degrades to per-process counters, which looks healthy
     # but silently multiplies the effective limit by the replica count.
@@ -261,6 +285,29 @@ async def request_id_middleware(request: Request, call_next):
         reset_request_id(token)
     response.headers["X-Request-ID"] = request_id
     return response
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics", response_model=None, responses={401: {"model": ErrorResponse}})
+async def metrics_endpoint(request: Request):
+    """Prometheus exposition of cost, latency, quality and queue metrics.
+
+    Authenticated for the same reason ``/health?deep=true`` is: the body
+    carries queue depths, document counts and per-department totals.
+    Prometheus scrapes it with a bearer token from its scrape config.
+
+    Served as text/plain — that is the exposition format, and returning
+    JSON here would simply not be scrapeable.
+    """
+    await verify_api_key(request)
+
+    from src.observability.prometheus import render
+
+    body = await asyncio.to_thread(render)
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +385,12 @@ def _ask_sync(body: AskRequest, session_id: str | None = None) -> AskResponse:
     caller's API key by the endpoint).
     """
     from src.observability.cost_callback import CostCallbackHandler, is_idk_response
+    from src.observability.cost_guard import start_query_budget
 
     resolved_mode = _resolve_mode(body)
+    # Ceiling for this query. Nodes consult it before optional, LLM-heavy
+    # work so a pathological question degrades instead of fanning out.
+    start_query_budget()
     handler = CostCallbackHandler()
     start = time.perf_counter()
     node_latencies = None
@@ -428,7 +479,9 @@ async def _stream_graph(body: AskRequest, request: Request, session_id: str | No
     try:
         from src.graph.tracing import start_run_capture
         from src.observability.cost_callback import CostCallbackHandler
+        from src.observability.cost_guard import start_query_budget
 
+        start_query_budget()
         handler = CostCallbackHandler()
         start = time.perf_counter()
 
@@ -524,8 +577,10 @@ async def _stream_naive(body: AskRequest, request: Request):
     in the 'done' event.
     """
     from src.observability.cost_callback import CostCallbackHandler
+    from src.observability.cost_guard import start_query_budget
     from src.rag.naive_rag import build_naive_rag_chain
 
+    start_query_budget()
     handler = CostCallbackHandler()
     start = time.perf_counter()
 
@@ -578,7 +633,7 @@ async def _stream_naive(body: AskRequest, request: Request):
 @app.post("/ask", response_model=AskResponse, responses={400: {"model": ErrorResponse}},
            dependencies=[Depends(verify_api_key)])
 @limiter.limit(settings.rate_limit_per_minute)
-async def ask_endpoint(request: Request, body: AskRequest):
+async def ask_endpoint(request: Request, response: Response, body: AskRequest):
     """Query the RAG pipeline. Set stream=true for Server-Sent Events."""
     if not body.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
@@ -587,6 +642,16 @@ async def ask_endpoint(request: Request, body: AskRequest):
     guardrail = check_guardrails(body.question)
     if not guardrail.safe:
         raise HTTPException(status_code=400, detail=guardrail.reason)
+
+    # Daily spend ceiling. Unlike the per-query budget — which degrades
+    # the answer — this one denies: its entire purpose is to stop runaway
+    # spend, so past the cap an operator has to intervene.
+    if daily_cap_exceeded():
+        raise HTTPException(
+            status_code=503,
+            detail="Daily cost cap reached. Queries resume at the next UTC day.",
+            headers={"Retry-After": str(_seconds_until_utc_midnight())},
+        )
 
     # Bind the session to the caller's API key so one client cannot read
     # another client's conversation history by guessing session IDs.
@@ -669,7 +734,7 @@ def _validate_ingest_path(raw_path: str) -> None:
 @app.post("/ingest", response_model=IngestResponse, responses={400: {"model": ErrorResponse}},
            dependencies=[Depends(verify_api_key)])
 @limiter.limit(settings.heavy_rate_limit)
-async def ingest_endpoint(request: Request, body: IngestRequest):
+async def ingest_endpoint(request: Request, response: Response, body: IngestRequest):
     """Ingest documents from a file or directory path under the ingest root."""
     _validate_ingest_path(body.path)
     try:
@@ -839,20 +904,28 @@ def _upload_async(
         registry.attach_storage(document_id, storage_key, storage_uri)
 
         # --- Publish Kafka Event ---
-        get_event_bus().publish(
-            settings.kafka_topic_ingestion,
-            Event(
-                event_type=DOCUMENT_UPLOADED,
-                document_id=document_id,
-                payload={
-                    "storage_key": storage_key,
-                    "filename": safe_name,
-                    "department": department,
-                    "checksum": checksum,
-                },
-                request_id=request_id,
-            ),
-        )
+        # The trace context rides inside the payload. Indexing happens in
+        # another process, possibly minutes later, so this is the only
+        # carrier available — and without it the upload span and the
+        # indexing span are two unrelated traces.
+        with otel.span(
+            "ingestion.publish",
+            **{"document.id": document_id, "document.department": department},
+        ):
+            get_event_bus().publish(
+                settings.kafka_topic_ingestion,
+                Event(
+                    event_type=DOCUMENT_UPLOADED,
+                    document_id=document_id,
+                    payload=otel.inject_context({
+                        "storage_key": storage_key,
+                        "filename": safe_name,
+                        "department": department,
+                        "checksum": checksum,
+                    }),
+                    request_id=request_id,
+                ),
+            )
     except Exception as e:
         # Leave a durable trace of the failure. The document is now FAILED,
         # so a re-upload takes the reset-and-requeue branch above rather
@@ -994,6 +1067,21 @@ async def upload_endpoint(
             status_code=413,
             detail=f"File too large ({len(content)} bytes). Maximum: {settings.max_upload_size_mb} MB.",
         )
+
+    # Refuse before storing the bytes, not after: accepting into a
+    # saturated queue costs object storage and hands the caller a 202 for
+    # work that will not happen for hours. Only meaningful on the async
+    # path — the sync path does the work inline, so there is no backlog
+    # to grow.
+    if settings.async_ingestion:
+        try:
+            await asyncio.to_thread(check_capacity)
+        except QueueSaturated as e:
+            raise HTTPException(
+                status_code=503,
+                detail=str(e),
+                headers={"Retry-After": str(retry_after_seconds(e.depth, e.limit))},
+            ) from e
 
     try:
         if settings.async_ingestion:
@@ -1177,8 +1265,22 @@ async def tools_endpoint():
 
 @app.post("/eval", response_model=EvalResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit(settings.heavy_rate_limit)
-async def eval_endpoint(request: Request, body: EvalRequest):
+async def eval_endpoint(request: Request, response: Response, body: EvalRequest):
     """Run the RAGAS evaluation suite. This is a long-running operation."""
+    # The suite is the most expensive thing this service does: every item
+    # generates an answer, then four LLM-judged metrics score it. A daily
+    # cap that /ask honours and this endpoint ignores is not a cap.
+    #
+    # Checked before the try block — HTTPException is an Exception, and the
+    # handler below would otherwise turn this refusal into a 500 — and
+    # before any work starts, since refusing after the spend saves nothing.
+    if daily_cap_exceeded():
+        raise HTTPException(
+            status_code=503,
+            detail="Daily cost cap reached. Evaluation resumes at the next UTC day.",
+            headers={"Retry-After": str(_seconds_until_utc_midnight())},
+        )
+
     try:
         from src.eval.ragas_eval import evaluate, load_eval_set
         from src.retrieval import get_retriever

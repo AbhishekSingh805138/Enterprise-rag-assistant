@@ -20,7 +20,7 @@ import threading
 import time
 
 from config import settings
-from src.events.bus import Event, EventBusError
+from src.events.bus import Event, EventBusError, IncompatibleSchemaError
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,17 @@ class KafkaEventBus:
             for record in records:
                 try:
                     event = Event.from_json(record.value)
+                except IncompatibleSchemaError as e:
+                    # Published by a newer version during a rolling
+                    # deploy. Committing past it would silently drop
+                    # valid work, so the offset is deliberately NOT
+                    # advanced: this consumer stops here and an upgraded
+                    # one resumes from the same place.
+                    logger.error(
+                        "Halting at %s[%d]@%d for an upgraded consumer: %s",
+                        record.topic, record.partition, record.offset, e,
+                    )
+                    return deliveries
                 except EventBusError:
                     # Poison payload: commit past it so it cannot block the
                     # partition, and record it loudly.

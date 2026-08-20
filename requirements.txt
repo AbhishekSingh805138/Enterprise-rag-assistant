@@ -48,8 +48,19 @@ python-dotenv>=1.0
 pydantic>=2.0
 fastapi>=0.115           # Phase 7
 uvicorn>=0.32            # Phase 7
+# /upload uses Form/UploadFile, which FastAPI cannot serve without this.
+# It was previously satisfied only transitively via streamlit, so an API
+# image built without the UI would import cleanly and then fail the first
+# upload request at runtime.
+python-multipart>=0.0.9
 slowapi>=0.1.9           # Rate limiting (Phase 7)
 redis>=5.0               # Shared rate limit counters across API replicas
+psycopg[binary]>=3.2     # Shared registry/memory/metrics/cache (DATABASE_URL)
+langchain-anthropic>=0.3  # Optional LLM_FALLBACK_PROVIDER=anthropic
+# Distributed tracing across the ingestion queue. Only imported when
+# OTEL_ENABLED=true, so this stays optional in practice.
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-http>=1.27
 streamlit>=1.40          # Chat UI (Phase 7)
 
 # Testing

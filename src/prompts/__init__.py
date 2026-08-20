@@ -1,5 +1,5 @@
 """Versioned prompt registry."""
-from src.prompts.registry import (  # noqa: F401
+from src.prompts.registry import (
     PromptRecord,
     get_prompt,
     list_prompts,

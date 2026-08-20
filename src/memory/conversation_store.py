@@ -7,12 +7,12 @@ the codebase (metrics_store.py, semantic_cache.py).
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
 from config import settings
+from src.storage.sql import SqlDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +33,21 @@ ON conversation_history (session_id, id);
 
 
 class ConversationStore:
-    """Thread-safe SQLite store for conversation history."""
+    """Conversation history, on SQLite or PostgreSQL (DATABASE_URL).
+
+    The one store where a local file breaks a user-visible feature rather
+    than an operational one: with two API replicas behind a load
+    balancer, a follow-up question routed to the other replica finds no
+    history and the assistant forgets the conversation mid-thread.
+    """
 
     def __init__(self, db_path: str) -> None:
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._db = SqlDatabase(db_path)
+        self._conn = self._db
+        self._lock = self._db.lock
         self._conn.execute(_CREATE_TABLE)
-        self._conn.execute(_CREATE_INDEX)
         self._conn.commit()
-        self._lock = threading.Lock()
+        self._db.executescript([_CREATE_INDEX])
 
     def add_message(self, session_id: str, role: str, content: str) -> None:
         """Append a message to the conversation history."""

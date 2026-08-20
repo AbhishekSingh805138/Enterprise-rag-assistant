@@ -132,10 +132,18 @@ class CostCallbackHandler(BaseCallbackHandler):
             completion_tok = token_usage.get("completion_tokens", 0)
             model = response.llm_output.get("model_name", model)
 
+        call_cost = compute_cost(model, prompt_tok, completion_tok)
         with self._counter_lock:
             self._prompt_tokens += prompt_tok
             self._completion_tokens += completion_tok
-            self._total_cost += compute_cost(model, prompt_tok, completion_tok)
+            self._total_cost += call_cost
+
+        # Report to the per-query ceiling so downstream stages can see the
+        # spend as it happens, rather than only in the metrics row written
+        # after the money is gone.
+        from src.observability.cost_guard import record_spend
+
+        record_spend(call_cost)
 
     def flush(
         self,

@@ -147,7 +147,14 @@ class Settings:
     # resets them. Point this at Redis before scaling out.
     #   RATE_LIMIT_STORAGE_URI=redis://redis:6379/0
     rate_limit_storage_uri: str = os.getenv("RATE_LIMIT_STORAGE_URI", "")
+    # Ceiling for a single query. Enforced mid-pipeline: past it, the
+    # pipeline stops elaborating (no further sub-questions, no query
+    # expansion, no critic) and answers with what it has. 0 disables.
     cost_budget_per_query: float = float(os.getenv("COST_BUDGET_PER_QUERY", "0.02"))
+    # Ceiling for a whole UTC day, across every query. Unlike the
+    # per-query budget this one rejects with 503 — it exists to stop
+    # runaway spend. 0 (the default) disables it.
+    cost_daily_cap_usd: float = float(os.getenv("COST_DAILY_CAP_USD", "0"))
 
     # Ingestion is restricted to paths under this root (prevents arbitrary
     # file reads via POST /ingest).
@@ -249,6 +256,38 @@ class Settings:
     ingest_visibility_timeout_s: int = int(os.getenv("INGEST_VISIBILITY_TIMEOUT_S", "300"))
     worker_poll_interval_s: float = float(os.getenv("WORKER_POLL_INTERVAL_S", "1.0"))
     worker_batch_size: int = int(os.getenv("WORKER_BATCH_SIZE", "1"))
+    # How many documents a worker indexes concurrently. Above 1 raises
+    # per-pod throughput without another process; the ceiling is embedding
+    # API rate limits, not CPU.
+    worker_concurrency: int = int(os.getenv("WORKER_CONCURRENCY", "1"))
+    # Backpressure: refuse uploads once this many events are queued, so
+    # callers stop receiving 202s for work that will not happen for hours.
+    # 0 disables the check.
+    ingest_max_queue_depth: int = int(os.getenv("INGEST_MAX_QUEUE_DEPTH", "1000"))
+    # Observed documents indexed per minute, used only to compute a
+    # Retry-After a client can act on.
+    ingest_drain_rate_per_minute: float = float(
+        os.getenv("INGEST_DRAIN_RATE_PER_MINUTE", "30")
+    )
+    # Bounds on parsing untrusted uploads. Both are permanent failures:
+    # retrying a decompression bomb spends the budget on the same result.
+    ingest_parse_timeout_s: float = float(os.getenv("INGEST_PARSE_TIMEOUT_S", "120"))
+    ingest_max_extracted_chars: int = int(
+        os.getenv("INGEST_MAX_EXTRACTED_CHARS", "20000000")  # ~20 MB of text
+    )
+    # PII handling at ingest: "off" (default, unchanged behaviour),
+    # "warn" (log what the corpus contains), "redact" (strip before
+    # embedding). Redaction changes what is retrievable, so it is opt-in.
+    ingest_pii_mode: str = os.getenv("INGEST_PII_MODE", "off")
+
+    # Shared relational store for the document registry, conversation
+    # memory and query metrics. Blank means per-store SQLite files, which
+    # are correct for exactly one host: a second replica gets its own
+    # registry (documents index twice) and its own memory (conversations
+    # lose their history). Required before scaling out.
+    #   DATABASE_URL=postgresql://rag:secret@postgres:5432/rag
+    database_url: str = _secret("DATABASE_URL")
+
     document_registry_path: str = os.getenv(
         "DOCUMENT_REGISTRY_PATH", str(PROJECT_ROOT / "checkpoints" / "documents.db")
     )
@@ -256,6 +295,18 @@ class Settings:
     # Emit one JSON object per log line (for log aggregators). Includes the
     # request/trace id so an upload can be followed API -> queue -> worker.
     json_logs: bool = os.getenv("JSON_LOGS", "false").lower() == "true"
+
+    # OpenTelemetry. Off by default: with it off the SDK is never even
+    # imported, so the dependency stays optional. The trace context is
+    # carried inside the event payload, which is the only carrier across
+    # the queue — that is what joins an upload to the indexing that
+    # happens minutes later in another process.
+    otel_enabled: bool = os.getenv("OTEL_ENABLED", "false").lower() == "true"
+    otel_service_name: str = os.getenv("OTEL_SERVICE_NAME", "enterprise-rag-assistant")
+    otel_service_version: str = os.getenv("OTEL_SERVICE_VERSION", "1.0.0")
+    otel_exporter_endpoint: str = os.getenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT", ""
+    )
 
     # Phase 8: Infrastructure
     chroma_refresh_interval: int = int(os.getenv("CHROMA_REFRESH_INTERVAL", "300"))
@@ -265,6 +316,11 @@ class Settings:
     # stale sparse retrieval can get. The corpus size is also checked on
     # each lookup, which catches most changes immediately.
     bm25_cache_ttl: int = int(os.getenv("BM25_CACHE_TTL", "300"))
+    # The sparse index holds the whole corpus in this process, per filter
+    # key. Past this many documents, hybrid retrieval degrades to
+    # dense-only rather than risking an out-of-memory kill. 0 disables
+    # the ceiling.
+    bm25_max_documents: int = int(os.getenv("BM25_MAX_DOCUMENTS", "200000"))
     document_ttl_days: int = int(os.getenv("DOCUMENT_TTL_DAYS", "0"))
     semantic_cache_enabled: bool = os.getenv("SEMANTIC_CACHE_ENABLED", "false").lower() == "true"
     semantic_cache_threshold: float = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.95"))
@@ -367,6 +423,11 @@ class Settings:
             )
         if self.storage_backend.lower() == "s3" and not self.s3_bucket:
             raise ValueError("STORAGE_BACKEND=s3 requires S3_BUCKET to be set.")
+        if self.ingest_pii_mode.lower() not in {"off", "warn", "redact"}:
+            raise ValueError(
+                f"Invalid INGEST_PII_MODE {self.ingest_pii_mode!r}. "
+                f"Choose from: off, warn, redact"
+            )
         if self.ingest_max_attempts < 1:
             raise ValueError(
                 f"ingest_max_attempts must be at least 1, got {self.ingest_max_attempts}"

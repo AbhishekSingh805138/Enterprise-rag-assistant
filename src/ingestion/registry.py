@@ -42,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from config import settings
+from src.storage.sql import SqlDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -139,23 +140,37 @@ class DocumentRecord:
 
 
 class DocumentRegistry:
-    """SQLite-backed registry. Safe across threads and processes (WAL)."""
+    """Registry of every uploaded document and its indexing state.
+
+    Backed by SQLite (safe across threads and processes on one host via
+    WAL) or, when ``DATABASE_URL`` is set, by PostgreSQL. The choice is
+    what decides whether the pipeline can run on more than one machine:
+    this table is the idempotency mechanism, so two workers with two
+    private copies of it will each happily index the same document.
+
+    The SQL is unchanged between the two — see :mod:`src.storage.sql` for
+    the handful of dialect differences it translates.
+    """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         path = Path(db_path or settings.document_registry_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = str(path)
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30)
-        self._conn.row_factory = sqlite3.Row
+        self._db = SqlDatabase(self._db_path)
+        self._lock = self._db.lock
+        self._conn = self._db
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=30000")
-            self._conn.execute(_CREATE_TABLE)
-            for stmt in _INDEXES:
-                self._conn.execute(stmt)
-            self._conn.commit()
-        logger.info("Document registry ready at %s", self._db_path)
+            if not self._db.postgres:
+                self._db.execute("PRAGMA busy_timeout=30000")
+            self._db.execute(_CREATE_TABLE)
+            self._db.commit()
+        # Indexes are created individually so an existing one does not
+        # abort the rest — Postgres aborts the whole transaction on error.
+        self._db.executescript(_INDEXES)
+        logger.info(
+            "Document registry ready (%s)",
+            "PostgreSQL" if self._db.postgres else self._db_path,
+        )
 
     # -- writes ------------------------------------------------------------
 
@@ -398,7 +413,8 @@ class DocumentRegistry:
         with self._lock:
             try:
                 self._conn.close()
-            except sqlite3.Error:
+            except Exception:
+                # Widened from sqlite3.Error: the backend may be psycopg.
                 logger.debug("Error closing document registry", exc_info=True)
 
 

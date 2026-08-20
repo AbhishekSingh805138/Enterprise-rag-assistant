@@ -106,11 +106,17 @@ class TestGraphCragSmoke:
     """CRAG graph pipeline should produce a string answer for all retrievers."""
 
     @pytest.fixture(autouse=True)
-    def _patch_graph_dependencies(self):
+    def _patch_graph_dependencies(self, stub_llm):
         """Replace individual node functions with stubs that return plain dicts.
 
         LangGraph serializes all state via msgpack, so node returns must be
         plain Python objects — no MagicMock anywhere in the state.
+
+        ``stub_llm`` covers the nodes this fixture does *not* stub — intent
+        detection, query transformation, the analyzer. They were reaching
+        the real API and swallowing the result in their fallback paths, so
+        the file's claim that "all external calls are mocked" was untrue
+        and each of these tests took ~20 seconds of billed latency.
         """
         def fake_planner(state):
             return {
@@ -368,6 +374,8 @@ class TestGraphStateSmoke:
             "cache_hit",
             # Phase 17: guardrails
             "guardrail_passed", "guardrail_reason",
+            # Cost ceiling: decomposition stopped early to stay in budget
+            "budget_truncated",
         }
         actual = set(RAGState.__annotations__.keys())
         assert expected == actual, f"Missing: {expected - actual}, Extra: {actual - expected}"

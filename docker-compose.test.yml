@@ -71,6 +71,24 @@ services:
       echo 'bucket ready'
       "
 
+  # The registry, memory and metrics stores on their production engine.
+  # SQLite passing only proves the SQL is valid for SQLite; the dialect
+  # differences the compat layer translates — placeholders, BIGSERIAL,
+  # ON CONFLICT — can only actually fail here.
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ragtest
+      POSTGRES_DB: rag
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   # Shared rate limit counters. The unit suite can only prove the limiter
   # is *configured* for Redis; proving two replicas actually share one
   # counter needs a real Redis.

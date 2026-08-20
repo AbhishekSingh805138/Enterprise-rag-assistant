@@ -485,7 +485,7 @@ class TestDataLookup:
 # === Graph integration tests (simple and multi-part paths) ===
 
 class TestGraphIntegration:
-    def test_simple_path_through_planner(self):
+    def test_simple_path_through_planner(self, stub_llm):
         """Simple question should go through planner → retrieve → ... → critic."""
         from langgraph.checkpoint.memory import InMemorySaver
 
@@ -535,7 +535,7 @@ class TestGraphIntegration:
         finally:
             bg.reset_graph()
 
-    def test_multi_part_path_through_planner(self):
+    def test_multi_part_path_through_planner(self, stub_llm):
         """Multi-part question should go planner → sub-query loop → synthesize → critic."""
         from langgraph.checkpoint.memory import InMemorySaver
 
