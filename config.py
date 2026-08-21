@@ -156,6 +156,16 @@ class Settings:
     # runaway spend. 0 (the default) disables it.
     cost_daily_cap_usd: float = float(os.getenv("COST_DAILY_CAP_USD", "0"))
 
+    # RAGAS judge concurrency and per-job deadline. ragas defaults to 16
+    # workers, 10 retries and a 60s max wait against a 180s timeout: on a
+    # rate-limited model those sixteen concurrent calls draw 429s, each is
+    # retried with backoff, and jobs start exceeding the deadline. A full
+    # 60-item run lost 48 of 240 judge jobs that way and reported the
+    # resulting gaps as a quality score. Fewer workers means fewer
+    # rejections to retry, which makes the run finish sooner, not later.
+    ragas_max_workers: int = int(os.getenv("RAGAS_MAX_WORKERS", "4"))
+    ragas_timeout_s: int = int(os.getenv("RAGAS_TIMEOUT_S", "600"))
+
     # Ingestion is restricted to paths under this root (prevents arbitrary
     # file reads via POST /ingest).
     ingest_root: str = os.getenv("INGEST_ROOT", str(PROJECT_ROOT / "data"))

@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from config import settings
+
 logger = logging.getLogger(__name__)
 
 EVAL_SET_PATH = Path(__file__).parent / "eval_set.json"
@@ -127,15 +129,27 @@ def run_ragas(rows: dict) -> dict:
         faithfulness,
     )
 
+    from ragas.run_config import RunConfig
+
     from src.observability.cost_callback import CostCallbackHandler
 
     dataset = Dataset.from_dict(rows)
     handler = CostCallbackHandler()
+    # Left at its defaults ragas runs 16 judge calls at once, retrying each
+    # rejection up to 10 times with waits up to 60s, against a 180s
+    # deadline. Against a rate-limited model that is a congestion collapse:
+    # the concurrency causes the 429s, the retries outlast the deadline,
+    # and the jobs that time out are scored as missing rather than failed.
+    run_config = RunConfig(
+        max_workers=max(1, settings.ragas_max_workers),
+        timeout=max(60, settings.ragas_timeout_s),
+    )
     start = time.perf_counter()
     result = ragas_evaluate(
         dataset,
         metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
         callbacks=[handler],
+        run_config=run_config,
     )
     try:
         record_judge_spend(

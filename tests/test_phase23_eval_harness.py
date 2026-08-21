@@ -60,8 +60,15 @@ def fake_ragas(monkeypatch):
 
     datasets_mod.Dataset = Dataset
 
+    # The real RunConfig, not a stand-in: it is a plain dataclass with no
+    # side effects, so the assertions below check the object the harness
+    # actually hands to ragas. Imported before `ragas` is replaced below.
+    from ragas.run_config import RunConfig
+
     ragas_mod = types.ModuleType("ragas")
     metrics_mod = types.ModuleType("ragas.metrics")
+    run_config_mod = types.ModuleType("ragas.run_config")
+    run_config_mod.RunConfig = RunConfig
 
     class Result:
         def __init__(self, scores):
@@ -75,6 +82,7 @@ def fake_ragas(monkeypatch):
         captured["dataset"] = dataset
         captured["metrics"] = metrics
         captured["callbacks"] = callbacks
+        captured["run_config"] = kwargs.get("run_config")
         return Result({
             "faithfulness": 0.812345,
             "answer_relevancy": 0.7654,
@@ -90,6 +98,7 @@ def fake_ragas(monkeypatch):
     monkeypatch.setitem(sys.modules, "datasets", datasets_mod)
     monkeypatch.setitem(sys.modules, "ragas", ragas_mod)
     monkeypatch.setitem(sys.modules, "ragas.metrics", metrics_mod)
+    monkeypatch.setitem(sys.modules, "ragas.run_config", run_config_mod)
     return captured
 
 
@@ -184,6 +193,45 @@ class TestCollectPredictions:
 # ---------------------------------------------------------------------------
 # run_ragas
 # ---------------------------------------------------------------------------
+
+class TestRagasRunConfig:
+    """Bound the judge's concurrency so a run can actually finish.
+
+    The first full 60-item run took 7h49m and lost 48 of 240 judge jobs to
+    TimeoutError, which dragged faithfulness to 0.677 against a historical
+    0.813 — a measurement artefact reported as a quality score. ragas
+    defaults to max_workers=16 with max_retries=10 and max_wait=60: on a
+    rate-limited model those sixteen concurrent calls produce 429s, each
+    retried with backoff, until jobs exceed the 180s timeout. Fewer
+    workers means fewer rejections to retry, so the run gets faster and
+    finishes, not slower.
+    """
+
+    def test_a_run_config_is_supplied(self, fake_ragas):
+        """Without one, ragas silently uses the defaults that collapsed."""
+        run_ragas({"question": []})
+        assert fake_ragas["run_config"] is not None
+
+    def test_concurrency_is_bounded_below_the_ragas_default(self, fake_ragas):
+        run_ragas({"question": []})
+        assert fake_ragas["run_config"].max_workers < 16
+
+    def test_the_deadline_has_headroom_over_the_default(self, fake_ragas):
+        """A throttled job needs longer than 180s to come back."""
+        run_ragas({"question": []})
+        assert fake_ragas["run_config"].timeout > 180
+
+    def test_both_are_tunable_without_a_code_change(self, fake_ragas):
+        """Settings is a frozen dataclass, so patch the module reference."""
+        from unittest.mock import patch
+
+        with patch("src.eval.ragas_eval.settings") as s:
+            s.ragas_max_workers = 3
+            s.ragas_timeout_s = 555
+            run_ragas({"question": []})
+        assert fake_ragas["run_config"].max_workers == 3
+        assert fake_ragas["run_config"].timeout == 555
+
 
 class TestRunRagas:
     def test_returns_the_metric_scores(self, fake_ragas):
