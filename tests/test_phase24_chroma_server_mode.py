@@ -16,6 +16,7 @@ here:
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -193,12 +194,20 @@ class TestServerModeClient:
 class TestBm25Staleness:
     @pytest.fixture
     def bm25_settings(self):
+        # _bm25_cache and _rebuilding are module globals that outlive any
+        # single test, and shutdown_rebuilds() deliberately does not clear
+        # _rebuilding. A key left behind by an earlier test makes
+        # _schedule_rebuild return early here, so no rebuild happens at all
+        # and the assertions below measure the wrong thing. Isolate on both
+        # sides rather than trusting the rest of the suite to tidy up.
+        hybrid.reset_bm25_cache()
         with patch("src.retrieval.hybrid.settings") as s:
             s.bm25_cache_ttl = 300
             s.rrf_k = 60
             s.bm25_max_documents = 0  # no memory ceiling in these tests
             yield s
             hybrid.shutdown_rebuilds()
+        hybrid.reset_bm25_cache()
 
     def _entry(self, built_at=None, source_count=10):
         return hybrid._CachedIndex(
@@ -269,21 +278,41 @@ class TestBm25Staleness:
         assert entry.source_count == 2
 
     def test_a_burst_of_queries_triggers_one_rebuild(self, bm25_settings):
-        """Otherwise a busy endpoint stacks a rebuild per request."""
+        """Otherwise a busy endpoint stacks a rebuild per request.
+
+        The burst has to overlap the rebuild for the guard to mean
+        anything, so the rebuild is held open until all five calls have
+        been issued. Previously this test just hoped the background thread
+        would still be working when the loop came round again — and when
+        it was not, the rebuild had already finished and released the
+        guard, so a later call scheduled a second one and the count came
+        back 2. That made a real invariant look intermittent.
+        """
+        burst_issued = threading.Event()
+
+        def _blocking_get(*args, **kwargs):
+            # Hold the corpus load open until the whole burst is in.
+            burst_issued.wait(timeout=10)
+            return {
+                "ids": ["1"], "documents": ["alpha document"], "metadatas": [{}],
+            }
+
         store = MagicMock()
-        store._collection.get.return_value = {
-            "ids": ["1"], "documents": ["alpha document"], "metadatas": [{}],
-        }
+        store._collection.get.side_effect = _blocking_get
         store._collection.count.return_value = 1
         hybrid._bm25_cache["__no_filter__"] = self._entry(source_count=99)
 
         with patch("src.vectorstore.chroma_store.get_vectorstore", return_value=store):
             for _ in range(5):
                 hybrid.HybridRetriever(k=2)._build_bm25_index()
+            burst_issued.set()
             hybrid.shutdown_rebuilds(wait=True)
 
         # One rebuild, so one corpus load — not five.
         assert store._collection.get.call_count == 1
+        # And it did finish: a rebuild that left the entry stale would let
+        # the next query schedule another, which is the failure this guards.
+        assert hybrid._bm25_cache["__no_filter__"].source_count == 1
 
     def test_a_failed_background_rebuild_leaves_the_cache_usable(self, bm25_settings, caplog):
         """A refresh that dies must not take sparse retrieval with it."""
