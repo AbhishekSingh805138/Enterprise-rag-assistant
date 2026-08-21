@@ -128,7 +128,6 @@ def run_ragas(rows: dict) -> dict:
         context_recall,
         faithfulness,
     )
-
     from ragas.run_config import RunConfig
 
     from src.observability.cost_callback import CostCallbackHandler
