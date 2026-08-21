@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 
 import requests
@@ -27,6 +28,57 @@ def _auth_headers() -> dict[str, str]:
     if RAG_API_KEY:
         return {"Authorization": f"Bearer {RAG_API_KEY}"}
     return {}
+
+
+# Statuses the registry will not move away from on its own.
+TERMINAL_STATUSES = frozenset({"PROCESSED", "FAILED", "DEAD_LETTER"})
+
+
+def _poll_document_status(
+    document_id: str,
+    *,
+    timeout_s: float = 90.0,
+    interval_s: float = 2.0,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> dict | None:
+    """Follow a queued upload until indexing settles.
+
+    With ASYNC_INGESTION the API returns 202 and a worker in another
+    process does the indexing, so "accepted" is not "searchable". Without
+    this the sidebar reported acceptance and stopped, which made a stalled
+    worker look identical to a slow one.
+
+    Returns the last record seen, or None if the API was never reachable.
+    A *non-terminal* status in the returned record means the deadline
+    passed — the caller must report that as still-in-progress rather than
+    as success, because that is the case where nothing is consuming the
+    queue.
+
+    The clock and the sleep are injectable so the behaviour can be tested
+    without waiting on real time.
+    """
+    deadline = monotonic() + timeout_s
+    last: dict | None = None
+    while True:
+        try:
+            resp = requests.get(
+                f"{API_URL}/documents/{document_id}",
+                headers=_auth_headers(),
+                timeout=10,
+            )
+            if resp.ok:
+                last = resp.json()
+                if last.get("status") in TERMINAL_STATUSES:
+                    return last
+        except requests.RequestException:
+            # An API restart mid-index is not an upload failure. Keep
+            # asking until the deadline rather than reporting a problem
+            # that may not exist.
+            pass
+        if monotonic() >= deadline:
+            return last
+        sleep(interval_s)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -338,9 +390,39 @@ with st.sidebar:
                         else:
                             st.success(
                                 f"**{result['filename']}** accepted for indexing  \n"
-                                f"Document `{result['document_id']}` — "
-                                f"track progress at `/documents/{result['document_id']}`"
+                                f"Document `{result['document_id']}`"
                             )
+                            _record = None
+                            with st.spinner("Waiting for the worker to index it..."):
+                                _record = _poll_document_status(result["document_id"])
+                            _status = (_record or {}).get("status")
+                            if _status == "PROCESSED":
+                                st.success(
+                                    f"Indexed — {_record.get('chunks_indexed', '?')} "
+                                    f"chunk(s). You can ask about it now."
+                                )
+                            elif _status in ("FAILED", "DEAD_LETTER"):
+                                st.error(
+                                    f"Indexing {_status.lower().replace('_', ' ')}: "
+                                    f"{_record.get('error') or 'no reason recorded'}"
+                                )
+                            elif _record is None:
+                                st.warning(
+                                    "Uploaded, but the API stopped responding before "
+                                    "indexing could be confirmed. Check "
+                                    f"`/documents/{result['document_id']}`."
+                                )
+                            else:
+                                # Still queued at the deadline. With
+                                # ASYNC_INGESTION the API only enqueues, so
+                                # the usual cause is that nothing is draining
+                                # the queue.
+                                st.warning(
+                                    f"Still `{_status}` after waiting — the file is "
+                                    "stored and queued but not indexed yet. If this "
+                                    "persists, check that the ingestion worker is "
+                                    "running (`python -m scripts.worker`)."
+                                )
                     else:
                         st.success(
                             f"**{result['filename']}** ingested  \n"
